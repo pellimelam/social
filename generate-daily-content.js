@@ -1,16 +1,10 @@
 'use strict';
 
 /*
- * Vidhwaan Daily Social
- * Daily Telugu Content Generator
- *
- * Generates exactly 6 Telugu sections:
- * 1. Daily Culture
- * 2. Daily Quote
- * 3. Daily Health
- * 4. Daily Science
- * 5. Daily Knowledge
- * 6. Daily Question
+ * ============================================================
+ * VIDHWAAN DAILY SOCIAL
+ * Production Daily Telugu Content Generator
+ * ============================================================
  *
  * Model:
  *   openai/gpt-oss-120b
@@ -21,23 +15,33 @@
  * Output:
  *   data/YYYY-MM-DD.json
  *
- * Important:
- *   - GROQ_API_KEY is read only from the environment.
- *   - No API key is written into generated files.
- *   - Telugu content only.
- *   - Strict JSON Schema Structured Outputs.
- *   - Previous generated files are used to reduce repetition.
+ * Environment:
+ *   GROQ_API_KEY
+ *   GROQ_MODEL   (optional)
+ *   TARGET_DATE  (optional)
+ *
+ * Design:
+ *   - Telugu-only user-facing content
+ *   - Strict JSON Schema
+ *   - Anti-repetition using previous daily JSON files
+ *   - Validation before publishing
+ *   - Automatic retry when generated content fails validation
+ *   - No API key written to files
+ *   - Never overwrites an existing daily JSON
+ *
+ * ============================================================
  */
-
-const fs = require('fs');
-const path = require('path');
 
 
 // ============================================================
 // CONFIGURATION
 // ============================================================
 
-const API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const fs = require('fs');
+const path = require('path');
+
+const API_URL =
+  'https://api.groq.com/openai/v1/chat/completions';
 
 const MODEL =
   process.env.GROQ_MODEL ||
@@ -61,7 +65,7 @@ const TARGET_DATE =
 
 
 // ============================================================
-// STARTUP VALIDATION
+// STARTUP
 // ============================================================
 
 if (!API_KEY) {
@@ -88,163 +92,363 @@ if (!isValidDate(TARGET_DATE)) {
 // ============================================================
 
 async function main() {
-  console.log('');
-  console.log('========================================');
-  console.log('VIDHWAAN DAILY SOCIAL');
-  console.log('Daily Content Generator');
-  console.log('========================================');
-  console.log(`Date: ${TARGET_DATE}`);
-  console.log(`Model: ${MODEL}`);
-  console.log('Timezone: Asia/Kolkata');
-  console.log('========================================');
-  console.log('');
+
+  printHeader();
 
   ensureDataDirectory();
 
   const outputFile =
-    path.join(DATA_DIR, `${TARGET_DATE}.json`);
+    path.join(
+      DATA_DIR,
+      `${TARGET_DATE}.json`
+    );
 
-  /*
-   * Never regenerate a date that already has a valid JSON file.
-   * This prevents accidental replacement of published content.
-   */
+
+  // ----------------------------------------------------------
+  // NEVER REPLACE AN EXISTING DAILY FILE
+  // ----------------------------------------------------------
+
   if (fs.existsSync(outputFile)) {
-    console.log('Daily JSON already exists.');
-    console.log(`File: ${outputFile}`);
+
+    console.log(
+      'Daily JSON already exists.'
+    );
+
+    console.log(
+      `File: ${outputFile}`
+    );
+
     console.log('');
-    console.log('Nothing to generate.');
+    console.log(
+      'Nothing to generate.'
+    );
+
     return;
   }
+
+
+  // ----------------------------------------------------------
+  // READ RECENT CONTENT
+  // ----------------------------------------------------------
 
   const recentContent =
     readRecentContent();
 
-  console.log('Generating six Telugu sections...');
+
+  // ----------------------------------------------------------
+  // GENERATE
+  // ----------------------------------------------------------
+
+  const content =
+    await generateValidatedContent(
+      recentContent
+    );
+
+
+  // ----------------------------------------------------------
+  // FINAL NORMALIZATION
+  // ----------------------------------------------------------
+
+  const finalContent =
+    normalizeFinalContent(
+      content
+    );
+
+
+  // ----------------------------------------------------------
+  // FINAL VALIDATION
+  // ----------------------------------------------------------
+
   console.log('');
+  console.log(
+    'Running final production validation...'
+  );
 
-  const generated =
-    await generateContent(recentContent);
+  validateContent(
+    finalContent
+  );
 
-  console.log('');
-  console.log('Validating generated content...');
-  console.log('');
 
-  /*
-   * Normalize harmless metadata variations before validation.
-   *
-   * The schema already requires "te", but this defensive assignment
-   * protects the pipeline if the API ever returns an equivalent
-   * language label despite the schema.
-   *
-   * We still validate the actual content for Telugu below.
-   */
-  generated.language = 'te';
-  generated.publisher = 'Vidhwaan';
-
-  validateContent(generated);
-
-  /*
-   * Ensure the final JSON contains only the exact production fields.
-   * This also protects against unexpected properties.
-   */
-  const finalContent = {
-    date: TARGET_DATE,
-    language: 'te',
-    publisher: 'Vidhwaan',
-
-    culture: {
-      heading: 'నేటి సంస్కృతి',
-      title: generated.culture.title.trim(),
-      content: generated.culture.content.trim(),
-      source: generated.culture.source.trim()
-    },
-
-    quote: {
-      heading: 'నేటి సూక్తి',
-      title: generated.quote.title.trim(),
-      content: generated.quote.content.trim(),
-      attribution: generated.quote.attribution.trim()
-    },
-
-    health: {
-      heading: 'నేటి ఆరోగ్యం',
-      title: generated.health.title.trim(),
-      content: generated.health.content.trim()
-    },
-
-    science: {
-      heading: 'నేటి విజ్ఞానం',
-      title: generated.science.title.trim(),
-      content: generated.science.content.trim()
-    },
-
-    knowledge: {
-      heading: 'నేటి జ్ఞానం',
-      title: generated.knowledge.title.trim(),
-      content: generated.knowledge.content.trim()
-    },
-
-    question: {
-      heading: 'నేటి ప్రశ్న',
-      question: generated.question.question.trim(),
-      answer: generated.question.answer.trim()
-    }
-  };
-
-  validateContent(finalContent);
+  // ----------------------------------------------------------
+  // WRITE FILE
+  // ----------------------------------------------------------
 
   fs.writeFileSync(
     outputFile,
-    JSON.stringify(finalContent, null, 2) + '\n',
+    JSON.stringify(
+      finalContent,
+      null,
+      2
+    ) + '\n',
     'utf8'
   );
 
+
+  // ----------------------------------------------------------
+  // SUCCESS
+  // ----------------------------------------------------------
+
+  console.log('');
   console.log('========================================');
   console.log('GENERATION SUCCESSFUL');
   console.log('========================================');
-  console.log(`Date: ${TARGET_DATE}`);
-  console.log(`File: ${outputFile}`);
+
+  console.log(
+    `Date: ${TARGET_DATE}`
+  );
+
+  console.log(
+    `File: ${outputFile}`
+  );
+
   console.log('');
-  console.log('Generated sections:');
-  console.log('1. నేటి సంస్కృతి');
-  console.log('2. నేటి సూక్తి');
-  console.log('3. నేటి ఆరోగ్యం');
-  console.log('4. నేటి విజ్ఞానం');
-  console.log('5. నేటి జ్ఞానం');
-  console.log('6. నేటి ప్రశ్న');
+
+  console.log(
+    '1. नేటి సంస్కృతి'
+  );
+
+  console.log(
+    '2. నేటి సూక్తి'
+  );
+
+  console.log(
+    '3. నేటి ఆరోగ్యం'
+  );
+
+  console.log(
+    '4. నేటి విజ్ఞానం'
+  );
+
+  console.log(
+    '5. నేటి జ్ఞానం'
+  );
+
+  console.log(
+    '6. నేటి ప్రశ్న'
+  );
+
   console.log('');
-  console.log('JSON validation: PASSED');
-  console.log('Telugu validation: PASSED');
-  console.log('Schema validation: PASSED');
+
+  console.log(
+    'Schema validation: PASSED'
+  );
+
+  console.log(
+    'Telugu validation: PASSED'
+  );
+
+  console.log(
+    'Content validation: PASSED'
+  );
+
+  console.log(
+    'Production validation: PASSED'
+  );
+
   console.log('========================================');
 }
 
 
 // ============================================================
-// GROQ GENERATION
+// GENERATE + VALIDATE + RETRY
 // ============================================================
 
-async function generateContent(recentContent) {
-  const systemPrompt = `
-You are the official daily content writer for Vidhwaan, a village-based global technology company.
+async function generateValidatedContent(
+  recentContent
+) {
 
-Your task is to create six high-quality daily social-media-ready Telugu content sections.
+  let lastError = null;
 
-IMPORTANT LANGUAGE RULES:
+  for (
+    let attempt = 1;
+    attempt <= MAX_ATTEMPTS;
+    attempt++
+  ) {
 
-1. ALL user-facing content MUST be written in natural Telugu.
-2. The JSON field "language" MUST be exactly:
-   "te"
-3. Never output:
-   "Telugu"
-   "telugu"
-   "te-IN"
-   "te_IN"
-   or any other language code.
-4. Do not write English explanations.
-5. English may appear only when absolutely necessary for a scientific or technical proper name.
+    console.log('');
+    console.log(
+      `Groq generation attempt ${attempt}/${MAX_ATTEMPTS}...`
+    );
 
-CONTENT SECTIONS:
+
+    const systemPrompt =
+      buildSystemPrompt();
+
+
+    const userPrompt =
+      buildUserPrompt(
+        recentContent,
+        lastError
+      );
+
+
+    try {
+
+      const response =
+        await requestGroq(
+          systemPrompt,
+          userPrompt
+        );
+
+
+      const rawContent =
+        extractGroqContent(
+          response
+        );
+
+
+      if (!rawContent) {
+        throw new Error(
+          'Groq returned an empty response.'
+        );
+      }
+
+
+      let parsed;
+
+      try {
+
+        parsed =
+          JSON.parse(
+            rawContent
+          );
+
+      } catch (error) {
+
+        throw new Error(
+          `Groq returned invalid JSON: ${error.message}`
+        );
+      }
+
+
+      /*
+       * Defensive metadata normalization.
+       *
+       * The schema itself requires:
+       *
+       * language = "te"
+       * publisher = "Vidhwaan"
+       */
+      parsed.language = 'te';
+
+      parsed.publisher = 'Vidhwaan';
+
+
+      console.log(
+        'Validating generated content...'
+      );
+
+
+      /*
+       * IMPORTANT:
+       *
+       * Validation happens INSIDE the retry loop.
+       *
+       * Therefore a bad answer such as English text in
+       * question.answer will cause another Groq request
+       * instead of immediately failing the entire workflow.
+       */
+      validateContent(
+        parsed
+      );
+
+
+      console.log(
+        'Generated content passed validation.'
+      );
+
+
+      return parsed;
+
+
+    } catch (error) {
+
+      lastError = error;
+
+      console.error('');
+      console.error(
+        `Attempt ${attempt} failed: ${error.message}`
+      );
+
+
+      if (
+        attempt <
+        MAX_ATTEMPTS
+      ) {
+
+        const waitMs =
+          getRetryDelay(
+            error,
+            attempt
+          );
+
+
+        console.log(
+          `Retrying after ${Math.ceil(waitMs / 1000)} seconds...`
+        );
+
+
+        await sleep(
+          waitMs
+        );
+      }
+    }
+  }
+
+
+  throw new Error(
+    `Generation failed after ${MAX_ATTEMPTS} attempts. ` +
+    `${lastError ? lastError.message : 'Unknown error.'}`
+  );
+}
+
+
+// ============================================================
+// SYSTEM PROMPT
+// ============================================================
+
+function buildSystemPrompt() {
+
+  return `
+You are the official daily content generator for Vidhwaan.
+
+Vidhwaan is a village-based global technology company.
+
+Generate six high-quality daily social-media-ready content sections for Telugu-speaking users.
+
+The final JSON MUST follow the supplied JSON Schema exactly.
+
+LANGUAGE:
+
+All user-facing content must be natural Telugu.
+
+The JSON metadata field "language" must be exactly:
+
+te
+
+Never output:
+Telugu
+telugu
+te-IN
+te_IN
+
+or another language code.
+
+Do not write English sentences in user-facing content.
+
+English may appear only when absolutely necessary for an unavoidable proper name, scientific name, abbreviation, mathematical notation, or Vidhwaan brand name.
+
+Do not mention:
+AI
+Groq
+the prompt
+the schema
+JSON generation
+internal instructions
+
+CONTENT:
+
+Generate exactly these six sections:
 
 1. నేటి సంస్కృతి
 2. నేటి సూక్తి
@@ -253,165 +457,243 @@ CONTENT SECTIONS:
 5. నేటి జ్ఞానం
 6. నేటి ప్రశ్న
 
-GENERAL QUALITY RULES:
+GENERAL RULES:
 
-- Content must be concise and shareable.
-- Content must be useful to Telugu-speaking people.
-- Avoid repetitive topics.
+- Content must be concise.
+- Content must be useful.
+- Content must be accurate.
+- Content must be suitable for a daily social card.
+- Avoid repetition.
 - Do not use markdown.
 - Do not use bullet points.
-- Do not use emojis.
 - Do not use hashtags.
 - Do not use URLs.
-- Do not mention AI.
-- Do not mention Groq.
-- Do not mention this prompt.
-- Do not mention JSON.
-- Do not address the reader with unnecessary promotional language.
+- Do not use emojis.
+- Do not use fake quotations.
 - Do not fabricate facts.
-- Do not invent quotations.
-- Do not invent scripture quotations.
-- Do not falsely attribute statements to gods, sages, authors, scientists, or historical people.
+- Do not make unsupported claims.
 
-CULTURE RULES:
+CULTURE:
 
-The culture section may cover:
-- Bhagavad Gita
-- Ramayana
-- Mahabharata
-- Vedas
-- Upanishads
-- Puranas
-- Hindu traditions
-- Indian festivals
-- temples and traditions
-- dharma
-- philosophy
-- Indian cultural practices
-- teachings associated with Hindu traditions
+The culture section can cover Hindu and Indian cultural knowledge including:
+
+Bhagavad Gita
+Ramayana
+Mahabharata
+Vedas
+Upanishads
+Puranas
+Indian traditions
+festivals
+temples
+dharma
+philosophy
+deities
+Indian cultural practices
 
 Be respectful and educational.
 
-If quoting scripture, use only wording that you are confident is genuine.
-Never create a fake quotation and attribute it to a scripture.
+Never fabricate a scripture quotation.
 
-If exact wording is uncertain, explain the teaching in your own Telugu words and provide an appropriate source description.
+Never attribute invented words to a deity, sage, scripture, or historical person.
 
-QUOTE RULES:
+If exact quotation wording is uncertain, explain the genuine teaching in your own Telugu words instead.
 
-The quote may be:
-- an original Vidhwaan thought, or
-- a reliably attributed quotation.
+QUOTE:
 
-Never invent an attribution.
+The quote can be:
 
-If the thought is original, use:
+1. An original Vidhwaan thought
+OR
+2. A reliably attributed quotation.
 
-attribution: "Vidhwaan"
+Never invent attribution.
 
-HEALTH RULES:
+If it is an original Vidhwaan thought, attribution must be:
 
-Health content must be general educational information.
+Vidhwaan
+
+HEALTH:
+
+Provide general health education only.
 
 Do not:
-- diagnose diseases
-- prescribe medicines
-- tell people to stop medicines
-- claim unsupported cures
-- give dangerous medical instructions
-- make guaranteed health claims
+- diagnose disease
+- prescribe medicine
+- tell users to stop medication
+- recommend dangerous treatment
+- promise cures
+- make unsupported medical claims
 
-SCIENCE RULES:
+SCIENCE:
 
-Science content must be factual and evidence-aligned.
+Use established scientific knowledge.
 
-Prefer:
-- astronomy
-- physics
-- biology
-- chemistry
-- Earth science
-- space
-- technology
-- nature
-- human body science
-- everyday science
+Possible subjects:
+astronomy
+space
+physics
+chemistry
+biology
+Earth
+nature
+technology
+human-body science
+everyday science
 
 Do not present speculation as established fact.
 
-KNOWLEDGE RULES:
+KNOWLEDGE:
 
-Knowledge can cover any useful subject, including:
-- history
-- geography
-- language
-- mathematics
-- nature
-- inventions
-- countries
-- animals
-- space
-- technology
-- economics
-- society
-- everyday useful knowledge
+Can cover useful knowledge from:
+history
+geography
+mathematics
+nature
+animals
+space
+technology
+countries
+language
+inventions
+society
+economics
+everyday knowledge
 
-QUESTION RULES:
+QUESTION:
 
-Create one enjoyable thinking question.
+Create an enjoyable thinking question.
 
 It MUST have a definite answer.
 
-The question should contain enough information for a person to solve it without needing outside information.
+The question must contain enough information to solve it.
 
-Avoid obscure trivia.
+Do not require obscure outside knowledge.
 
-The answer must clearly and directly answer the question.
+The answer must be correct.
 
-VARIETY RULE:
+IMPORTANT QUESTION ANSWER RULE:
 
-Do not repeat the same topic, example, quotation, fact, question pattern, or subject from recent content.
+The answer should normally be written in Telugu.
 
-Recent generated content is provided below.
+However, a pure mathematical or numerical answer is valid.
 
-Use it only to avoid repetition.
+Examples of valid answers:
+
+42
+8
+3.14
+100%
+25°C
+2 గంటలు
+
+Do NOT write an English sentence such as:
+
+The answer is 42.
+
+Instead write:
+
+42
+
+or:
+
+సమాధానం 42.
+
+ANTI-REPETITION:
+
+Avoid repeating recent topics, questions, facts, quotations, examples, or subject patterns.
+
+Recent content is supplied by the application.
+
 Do not copy it.
 
-The final output MUST strictly follow the supplied JSON Schema.
-`;
+VARIETY:
 
-  const userPrompt = `
-Create the Vidhwaan Daily Social content for:
+Each day should feel meaningfully different from previous days.
+
+QUALITY:
+
+Prefer useful, memorable, clear information over obscure trivia.
+
+The output must be publication-ready.
+`;
+}
+
+
+// ============================================================
+// USER PROMPT
+// ============================================================
+
+function buildUserPrompt(
+  recentContent,
+  previousError
+) {
+
+  let retryInstruction = '';
+
+  if (previousError) {
+
+    retryInstruction = `
+IMPORTANT CORRECTION FROM PREVIOUS ATTEMPT:
+
+The previous generated content failed validation for this reason:
+
+${previousError}
+
+Generate a completely corrected response.
+
+Pay particular attention to question.answer.
+If the answer is numerical, a numeric answer is acceptable.
+If it is explanatory, write the explanation in Telugu.
+Do not write an English sentence as the answer.
+`;
+  }
+
+
+  return `
+Generate today's Vidhwaan Daily Social content.
 
 DATE:
+
 ${TARGET_DATE}
 
-CANONICAL LANGUAGE:
+LANGUAGE:
+
 te
 
 PUBLISHER:
+
 Vidhwaan
 
-Create exactly six sections.
+Generate exactly six sections.
 
-The final content must be suitable for publication on the Vidhwaan Daily Social PWA.
+The content will be displayed directly to Telugu users and converted into vertical social/reel images.
 
-Keep each section concise enough to fit a beautiful vertical social/reel image.
+Keep content concise and visually suitable.
 
-Recent content to avoid repeating:
+${retryInstruction}
 
-${recentContent || 'No previous content is available. This is the first generation.'}
+RECENT CONTENT TO AVOID REPEATING:
 
-Remember:
+${recentContent || 'No previous daily content is available.'}
 
-The JSON field language MUST be exactly "te".
-All user-facing content MUST be Telugu.
+Return only the JSON required by the supplied schema.
 `;
+}
 
-  const schema = {
+
+// ============================================================
+// JSON SCHEMA
+// ============================================================
+
+function getSchema() {
+
+  return {
+
     type: 'object',
 
     properties: {
+
       date: {
         type: 'string'
       },
@@ -426,10 +708,13 @@ All user-facing content MUST be Telugu.
         enum: ['Vidhwaan']
       },
 
+
       culture: {
+
         type: 'object',
 
         properties: {
+
           heading: {
             type: 'string',
             enum: ['నేటి సంస్కృతి']
@@ -458,10 +743,13 @@ All user-facing content MUST be Telugu.
         additionalProperties: false
       },
 
+
       quote: {
+
         type: 'object',
 
         properties: {
+
           heading: {
             type: 'string',
             enum: ['నేటి సూక్తి']
@@ -490,10 +778,13 @@ All user-facing content MUST be Telugu.
         additionalProperties: false
       },
 
+
       health: {
+
         type: 'object',
 
         properties: {
+
           heading: {
             type: 'string',
             enum: ['నేటి ఆరోగ్యం']
@@ -517,10 +808,13 @@ All user-facing content MUST be Telugu.
         additionalProperties: false
       },
 
+
       science: {
+
         type: 'object',
 
         properties: {
+
           heading: {
             type: 'string',
             enum: ['నేటి విజ్ఞానం']
@@ -544,10 +838,13 @@ All user-facing content MUST be Telugu.
         additionalProperties: false
       },
 
+
       knowledge: {
+
         type: 'object',
 
         properties: {
+
           heading: {
             type: 'string',
             enum: ['నేటి జ్ఞానం']
@@ -571,10 +868,13 @@ All user-facing content MUST be Telugu.
         additionalProperties: false
       },
 
+
       question: {
+
         type: 'object',
 
         properties: {
+
           heading: {
             type: 'string',
             enum: ['నేటి ప్రశ్న']
@@ -613,89 +913,18 @@ All user-facing content MUST be Telugu.
 
     additionalProperties: false
   };
-
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    console.log(`Groq request ${attempt}/${MAX_ATTEMPTS}...`);
-
-    try {
-      const response =
-        await requestGroq(
-          systemPrompt,
-          userPrompt,
-          schema
-        );
-
-      const content =
-        extractGroqContent(response);
-
-      if (!content) {
-        throw new Error(
-          'Groq returned an empty response.'
-        );
-      }
-
-      let parsed;
-
-      try {
-        parsed = JSON.parse(content);
-      } catch (error) {
-        throw new Error(
-          `Groq returned invalid JSON: ${error.message}`
-        );
-      }
-
-      /*
-       * Defensive normalization.
-       *
-       * Strict schema should already produce "te".
-       * This is deliberately limited to metadata.
-       * Actual Telugu content is still validated separately.
-       */
-      parsed.language = 'te';
-      parsed.publisher = 'Vidhwaan';
-
-      return parsed;
-
-    } catch (error) {
-      lastError = error;
-
-      console.error('');
-      console.error(
-        `Groq request ${attempt} failed: ${error.message}`
-      );
-      console.error('');
-
-      if (attempt < MAX_ATTEMPTS) {
-        const waitMs =
-          getRetryDelay(error, attempt);
-
-        console.log(
-          `Waiting ${Math.round(waitMs / 1000)} seconds before retry...`
-        );
-
-        await sleep(waitMs);
-      }
-    }
-  }
-
-  throw new Error(
-    `Groq generation failed after ${MAX_ATTEMPTS} attempts. ` +
-    `${lastError ? lastError.message : 'Unknown error.'}`
-  );
 }
 
 
 // ============================================================
-// GROQ HTTP REQUEST
+// GROQ REQUEST
 // ============================================================
 
 async function requestGroq(
   systemPrompt,
-  userPrompt,
-  schema
+  userPrompt
 ) {
+
   const controller =
     new AbortController();
 
@@ -705,84 +934,91 @@ async function requestGroq(
       REQUEST_TIMEOUT_MS
     );
 
+
   try {
+
     const response =
-      await fetch(API_URL, {
-        method: 'POST',
+      await fetch(
+        API_URL,
+        {
+          method: 'POST',
 
-        headers: {
-          'Authorization': `Bearer ${API_KEY}`,
-          'Content-Type': 'application/json'
-        },
+          headers: {
+            'Authorization':
+              `Bearer ${API_KEY}`,
 
-        body: JSON.stringify({
-          model: MODEL,
-
-          messages: [
-            {
-              role: 'system',
-              content: systemPrompt
-            },
-            {
-              role: 'user',
-              content: userPrompt
-            }
-          ],
-
-          /*
-           * GPT-OSS 120B supports strict structured outputs.
-           * This makes the response conform to our schema.
-           */
-          response_format: {
-            type: 'json_schema',
-
-            json_schema: {
-              name: 'vidhwaan_daily_social',
-
-              strict: true,
-
-              schema
-            }
+            'Content-Type':
+              'application/json'
           },
 
-          /*
-           * Moderate creativity while keeping content controlled.
-           */
-          temperature: 0.7,
+          body: JSON.stringify({
 
-          /*
-           * Give enough output space for all six sections.
-           */
-          max_completion_tokens: 5000
-        }),
+            model: MODEL,
 
-        signal: controller.signal
-      });
+            messages: [
 
-    const text =
+              {
+                role: 'system',
+                content: systemPrompt
+              },
+
+              {
+                role: 'user',
+                content: userPrompt
+              }
+
+            ],
+
+            response_format: {
+
+              type: 'json_schema',
+
+              json_schema: {
+
+                name:
+                  'vidhwaan_daily_social',
+
+                strict:
+                  true,
+
+                schema:
+                  getSchema()
+              }
+            },
+
+            temperature:
+              0.7,
+
+            max_completion_tokens:
+              5000
+
+          }),
+
+          signal:
+            controller.signal
+        }
+      );
+
+
+    const responseText =
       await response.text();
+
 
     let data;
 
-    try {
-      data =
-        JSON.parse(text);
-    } catch {
-      throw new Error(
-        `Groq returned non-JSON HTTP response. ` +
-        `HTTP ${response.status}: ${text.slice(0, 500)}`
-      );
-    }
 
-    if (!response.ok) {
-      const message =
-        data?.error?.message ||
-        data?.message ||
-        `HTTP ${response.status}`;
+    try {
+
+      data =
+        JSON.parse(
+          responseText
+        );
+
+    } catch {
 
       const error =
         new Error(
-          `Groq API error ${response.status}: ${message}`
+          `Groq returned a non-JSON HTTP response. HTTP ${response.status}: ${responseText.slice(0, 500)}`
         );
 
       error.status =
@@ -791,234 +1027,241 @@ async function requestGroq(
       throw error;
     }
 
+
+    if (!response.ok) {
+
+      const message =
+        data?.error?.message ||
+        data?.message ||
+        `HTTP ${response.status}`;
+
+
+      const error =
+        new Error(
+          `Groq API error ${response.status}: ${message}`
+        );
+
+
+      error.status =
+        response.status;
+
+
+      throw error;
+    }
+
+
     return data;
 
+
   } catch (error) {
-    if (error.name === 'AbortError') {
+
+    if (
+      error.name ===
+      'AbortError'
+    ) {
+
       const timeoutError =
         new Error(
           `Groq request timed out after ${REQUEST_TIMEOUT_MS / 1000} seconds.`
         );
 
-      timeoutError.retryable = true;
+      timeoutError.retryable =
+        true;
 
       throw timeoutError;
     }
 
+
     throw error;
 
+
   } finally {
-    clearTimeout(timeout);
+
+    clearTimeout(
+      timeout
+    );
   }
 }
 
 
 // ============================================================
-// GROQ RESPONSE EXTRACTION
+// EXTRACT GROQ CONTENT
 // ============================================================
 
-function extractGroqContent(response) {
-  /*
-   * Standard Chat Completions response:
-   *
-   * choices[0].message.content
-   */
+function extractGroqContent(
+  response
+) {
 
   const content =
-    response?.choices?.[0]?.message?.content;
+    response
+      ?.choices
+      ?.at(0)
+      ?.message
+      ?.content;
 
-  if (typeof content === 'string') {
+
+  if (
+    typeof content ===
+    'string'
+  ) {
+
     return content.trim();
   }
 
-  /*
-   * Some API responses can expose refusal information.
-   */
+
   const refusal =
-    response?.choices?.[0]?.message?.refusal;
+    response
+      ?.choices
+      ?.at(0)
+      ?.message
+      ?.refusal;
+
 
   if (refusal) {
+
     throw new Error(
       `Groq refused the generation: ${refusal}`
     );
   }
+
 
   return '';
 }
 
 
 // ============================================================
-// RETRY LOGIC
+// FINAL NORMALIZATION
 // ============================================================
 
-function getRetryDelay(error, attempt) {
-  const status =
-    error?.status;
+function normalizeFinalContent(
+  data
+) {
 
-  /*
-   * Rate limiting:
-   * Prefer Retry-After if available.
-   *
-   * Since this implementation does not currently expose
-   * response headers through the thrown error, use exponential
-   * backoff with jitter.
-   */
-  if (status === 429) {
-    return (
-      15000 +
-      Math.floor(Math.random() * 5000)
-    ) * attempt;
-  }
+  return {
 
-  /*
-   * Temporary server/network errors.
-   */
-  if (
-    status === 408 ||
-    status === 409 ||
-    status === 500 ||
-    status === 502 ||
-    status === 503 ||
-    status === 504 ||
-    error?.retryable
-  ) {
-    return (
-      5000 * attempt
-    ) + Math.floor(Math.random() * 2000);
-  }
+    date:
+      TARGET_DATE,
 
-  /*
-   * Other errors are normally not worth a long retry,
-   * but we still give the generator one controlled retry.
-   */
-  return (
-    3000 * attempt
-  );
+    language:
+      'te',
+
+    publisher:
+      'Vidhwaan',
+
+
+    culture: {
+
+      heading:
+        'నేటి సంస్కృతి',
+
+      title:
+        data.culture.title.trim(),
+
+      content:
+        data.culture.content.trim(),
+
+      source:
+        data.culture.source.trim()
+    },
+
+
+    quote: {
+
+      heading:
+        'నేటి సూక్తి',
+
+      title:
+        data.quote.title.trim(),
+
+      content:
+        data.quote.content.trim(),
+
+      attribution:
+        data.quote.attribution.trim()
+    },
+
+
+    health: {
+
+      heading:
+        'నేటి ఆరోగ్యం',
+
+      title:
+        data.health.title.trim(),
+
+      content:
+        data.health.content.trim()
+    },
+
+
+    science: {
+
+      heading:
+        'నేటి విజ్ఞానం',
+
+      title:
+        data.science.title.trim(),
+
+      content:
+        data.science.content.trim()
+    },
+
+
+    knowledge: {
+
+      heading:
+        'నేటి జ్ఞానం',
+
+      title:
+        data.knowledge.title.trim(),
+
+      content:
+        data.knowledge.content.trim()
+    },
+
+
+    question: {
+
+      heading:
+        'నేటి ప్రశ్న',
+
+      question:
+        data.question.question.trim(),
+
+      answer:
+        normalizeQuestionAnswer(
+          data.question.answer
+        )
+    }
+  };
 }
 
 
 // ============================================================
-// RECENT CONTENT
+// QUESTION ANSWER NORMALIZATION
 // ============================================================
 
-function readRecentContent() {
-  if (!fs.existsSync(DATA_DIR)) {
-    return '';
-  }
+function normalizeQuestionAnswer(
+  answer
+) {
 
-  let files;
+  const value =
+    String(answer || '')
+      .trim();
 
-  try {
-    files =
-      fs.readdirSync(DATA_DIR)
-        .filter(
-          file =>
-            /^\d{4}-\d{2}-\d{2}\.json$/.test(file)
-        )
-        .sort()
-        .reverse()
-        .slice(0, MAX_RECENT_FILES);
-
-  } catch (error) {
-    console.warn(
-      `Could not read recent content: ${error.message}`
-    );
-
-    return '';
-  }
-
-  if (files.length === 0) {
-    return '';
-  }
-
-  const recent = [];
-
-  for (const file of files) {
-    const filePath =
-      path.join(DATA_DIR, file);
-
-    try {
-      const raw =
-        fs.readFileSync(
-          filePath,
-          'utf8'
-        );
-
-      const data =
-        JSON.parse(raw);
-
-      recent.push({
-        date: data.date || file.replace('.json', ''),
-
-        culture:
-          data.culture
-            ? {
-                title: data.culture.title,
-                content: data.culture.content
-              }
-            : null,
-
-        quote:
-          data.quote
-            ? {
-                title: data.quote.title,
-                content: data.quote.content
-              }
-            : null,
-
-        health:
-          data.health
-            ? {
-                title: data.health.title,
-                content: data.health.content
-              }
-            : null,
-
-        science:
-          data.science
-            ? {
-                title: data.science.title,
-                content: data.science.content
-              }
-            : null,
-
-        knowledge:
-          data.knowledge
-            ? {
-                title: data.knowledge.title,
-                content: data.knowledge.content
-              }
-            : null,
-
-        question:
-          data.question
-            ? {
-                question: data.question.question,
-                answer: data.question.answer
-              }
-            : null
-      });
-
-    } catch (error) {
-      console.warn(
-        `Skipping invalid recent file ${file}: ${error.message}`
-      );
-    }
-  }
-
-  if (recent.length === 0) {
-    return '';
-  }
 
   /*
-   * Keep the prompt reasonably sized.
-   * We don't need entire old JSON files.
+   * Pure numerical answers are valid.
+   *
+   * Examples:
+   * 42
+   * 3.14
+   * 100%
+   * 25°C
+   * 2 గంటలు
    */
-  return JSON.stringify(
-    recent,
-    null,
-    2
-  );
+
+  return value;
 }
 
 
@@ -1026,75 +1269,108 @@ function readRecentContent() {
 // VALIDATION
 // ============================================================
 
-function validateContent(data) {
-  if (!data || typeof data !== 'object') {
+function validateContent(
+  data
+) {
+
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    Array.isArray(data)
+  ) {
+
     throw new Error(
-      'Generated content is not an object.'
+      'Generated content must be an object.'
     );
   }
 
-  /*
-   * Exact top-level fields.
-   */
-  const expectedKeys = [
+
+  const expectedTopLevelKeys = [
+
     'date',
     'language',
     'publisher',
+
     'culture',
     'quote',
     'health',
     'science',
     'knowledge',
     'question'
+
   ];
 
-  const actualKeys =
-    Object.keys(data).sort();
 
-  const expectedSorted =
-    [...expectedKeys].sort();
+  const actualKeys =
+    Object.keys(data)
+      .sort();
+
+
+  const expectedKeys =
+    [...expectedTopLevelKeys]
+      .sort();
+
 
   if (
     JSON.stringify(actualKeys) !==
-    JSON.stringify(expectedSorted)
+    JSON.stringify(expectedKeys)
   ) {
+
     throw new Error(
-      `Unexpected top-level fields. ` +
-      `Expected: ${expectedKeys.join(', ')}. ` +
-      `Received: ${actualKeys.join(', ')}.`
+      `Unexpected top-level fields. Received: ${actualKeys.join(', ')}`
     );
   }
 
-  /*
-   * Date.
-   */
-  if (data.date !== TARGET_DATE) {
+
+  // ----------------------------------------------------------
+  // DATE
+  // ----------------------------------------------------------
+
+  if (
+    data.date !==
+    TARGET_DATE
+  ) {
+
     throw new Error(
       `date must be "${TARGET_DATE}". Received "${data.date}".`
     );
   }
 
-  /*
-   * Language.
-   */
-  if (data.language !== 'te') {
+
+  // ----------------------------------------------------------
+  // LANGUAGE
+  // ----------------------------------------------------------
+
+  if (
+    data.language !==
+    'te'
+  ) {
+
     throw new Error(
       'language must be "te".'
     );
   }
 
-  /*
-   * Publisher.
-   */
-  if (data.publisher !== 'Vidhwaan') {
+
+  // ----------------------------------------------------------
+  // PUBLISHER
+  // ----------------------------------------------------------
+
+  if (
+    data.publisher !==
+    'Vidhwaan'
+  ) {
+
     throw new Error(
       'publisher must be "Vidhwaan".'
     );
   }
 
-  /*
-   * Validate each section.
-   */
+
+  // ----------------------------------------------------------
+  // SECTION STRUCTURE
+  // ----------------------------------------------------------
+
   validateSection(
     data.culture,
     'culture',
@@ -1105,6 +1381,7 @@ function validateContent(data) {
       'source'
     ]
   );
+
 
   validateSection(
     data.quote,
@@ -1117,6 +1394,7 @@ function validateContent(data) {
     ]
   );
 
+
   validateSection(
     data.health,
     'health',
@@ -1126,6 +1404,7 @@ function validateContent(data) {
       'content'
     ]
   );
+
 
   validateSection(
     data.science,
@@ -1137,6 +1416,7 @@ function validateContent(data) {
     ]
   );
 
+
   validateSection(
     data.knowledge,
     'knowledge',
@@ -1146,6 +1426,7 @@ function validateContent(data) {
       'content'
     ]
   );
+
 
   validateSection(
     data.question,
@@ -1157,98 +1438,163 @@ function validateContent(data) {
     ]
   );
 
-  /*
-   * Exact headings.
-   */
+
+  // ----------------------------------------------------------
+  // HEADINGS
+  // ----------------------------------------------------------
+
   if (
     data.culture.heading !==
     'నేటి సంస్కృతి'
   ) {
+
     throw new Error(
       'Culture heading is incorrect.'
     );
   }
 
+
   if (
     data.quote.heading !==
     'నేటి సూక్తి'
   ) {
+
     throw new Error(
       'Quote heading is incorrect.'
     );
   }
 
+
   if (
     data.health.heading !==
     'నేటి ఆరోగ్యం'
   ) {
+
     throw new Error(
       'Health heading is incorrect.'
     );
   }
 
+
   if (
     data.science.heading !==
     'నేటి విజ్ఞానం'
   ) {
+
     throw new Error(
       'Science heading is incorrect.'
     );
   }
 
+
   if (
     data.knowledge.heading !==
     'నేటి జ్ఞానం'
   ) {
+
     throw new Error(
       'Knowledge heading is incorrect.'
     );
   }
 
+
   if (
     data.question.heading !==
     'నేటి ప్రశ్న'
   ) {
+
     throw new Error(
       'Question heading is incorrect.'
     );
   }
 
+
+  // ----------------------------------------------------------
+  // TELUGU CONTENT
+  // ----------------------------------------------------------
+
+  requireTelugu(
+    'culture.title',
+    data.culture.title
+  );
+
+  requireTelugu(
+    'culture.content',
+    data.culture.content
+  );
+
+
+  requireTelugu(
+    'quote.title',
+    data.quote.title
+  );
+
+  requireTelugu(
+    'quote.content',
+    data.quote.content
+  );
+
+
+  requireTelugu(
+    'health.title',
+    data.health.title
+  );
+
+  requireTelugu(
+    'health.content',
+    data.health.content
+  );
+
+
+  requireTelugu(
+    'science.title',
+    data.science.title
+  );
+
+  requireTelugu(
+    'science.content',
+    data.science.content
+  );
+
+
+  requireTelugu(
+    'knowledge.title',
+    data.knowledge.title
+  );
+
+  requireTelugu(
+    'knowledge.content',
+    data.knowledge.content
+  );
+
+
+  requireTelugu(
+    'question.question',
+    data.question.question
+  );
+
+
   /*
-   * Telugu content validation.
+   * IMPORTANT:
+   *
+   * question.answer is intentionally NOT required to contain
+   * Telugu Unicode.
+   *
+   * A mathematical/numerical answer is valid.
+   *
+   * Instead, we reject English/Latin sentences.
    */
-  const teluguFields = [
-    ['culture.title', data.culture.title],
-    ['culture.content', data.culture.content],
+  validateQuestionAnswer(
+    data.question.answer
+  );
 
-    ['quote.title', data.quote.title],
-    ['quote.content', data.quote.content],
 
-    ['health.title', data.health.title],
-    ['health.content', data.health.content],
+  // ----------------------------------------------------------
+  // FORBIDDEN MARKUP / URLS
+  // ----------------------------------------------------------
 
-    ['science.title', data.science.title],
-    ['science.content', data.science.content],
-
-    ['knowledge.title', data.knowledge.title],
-    ['knowledge.content', data.knowledge.content],
-
-    ['question.question', data.question.question],
-    ['question.answer', data.question.answer]
-  ];
-
-  for (const [field, value] of teluguFields) {
-    if (!containsTelugu(value)) {
-      throw new Error(
-        `${field} does not contain Telugu text.`
-      );
-    }
-  }
-
-  /*
-   * Validate all textual fields against unwanted output.
-   */
   const allText = [
+
     data.culture.title,
     data.culture.content,
     data.culture.source,
@@ -1268,16 +1614,19 @@ function validateContent(data) {
 
     data.question.question,
     data.question.answer
+
   ].join('\n');
 
-  validateForbiddenText(allText);
 
-  /*
-   * Length checks.
-   *
-   * These limits keep the generated content suitable for
-   * mobile cards and 1080x1920 share images.
-   */
+  validateForbiddenText(
+    allText
+  );
+
+
+  // ----------------------------------------------------------
+  // LENGTHS
+  // ----------------------------------------------------------
+
   validateLength(
     'culture.title',
     data.culture.title,
@@ -1295,6 +1644,7 @@ function validateContent(data) {
     data.culture.source,
     180
   );
+
 
   validateLength(
     'quote.title',
@@ -1314,6 +1664,7 @@ function validateContent(data) {
     150
   );
 
+
   validateLength(
     'health.title',
     data.health.title,
@@ -1325,6 +1676,7 @@ function validateContent(data) {
     data.health.content,
     650
   );
+
 
   validateLength(
     'science.title',
@@ -1338,6 +1690,7 @@ function validateContent(data) {
     700
   );
 
+
   validateLength(
     'knowledge.title',
     data.knowledge.title,
@@ -1349,6 +1702,7 @@ function validateContent(data) {
     data.knowledge.content,
     700
   );
+
 
   validateLength(
     'question.question',
@@ -1370,76 +1724,233 @@ function validateContent(data) {
 
 function validateSection(
   section,
-  sectionName,
+  name,
   requiredFields
 ) {
+
   if (
     !section ||
     typeof section !== 'object' ||
     Array.isArray(section)
   ) {
+
     throw new Error(
-      `${sectionName} must be an object.`
+      `${name} must be an object.`
     );
   }
 
-  for (const field of requiredFields) {
+
+  for (
+    const field of requiredFields
+  ) {
+
     if (
-      typeof section[field] !== 'string' ||
+      typeof section[field] !==
+      'string'
+    ) {
+
+      throw new Error(
+        `${name}.${field} must be a string.`
+      );
+    }
+
+
+    if (
       section[field].trim().length === 0
     ) {
+
       throw new Error(
-        `${sectionName}.${field} must be a non-empty string.`
+        `${name}.${field} cannot be empty.`
       );
     }
   }
 
+
   const actualKeys =
-    Object.keys(section).sort();
+    Object.keys(section)
+      .sort();
+
 
   const expectedKeys =
-    [...requiredFields].sort();
+    [...requiredFields]
+      .sort();
+
 
   if (
     JSON.stringify(actualKeys) !==
     JSON.stringify(expectedKeys)
   ) {
+
     throw new Error(
-      `${sectionName} contains unexpected fields.`
+      `${name} contains unexpected fields.`
     );
   }
 }
 
 
 // ============================================================
-// FORBIDDEN TEXT VALIDATION
+// TELUGU VALIDATION
 // ============================================================
 
-function validateForbiddenText(text) {
-  const forbiddenPatterns = [
+function requireTelugu(
+  field,
+  value
+) {
+
+  if (
+    !containsTelugu(value)
+  ) {
+
+    throw new Error(
+      `${field} does not contain Telugu text.`
+    );
+  }
+}
+
+
+function containsTelugu(
+  value
+) {
+
+  return /[\u0C00-\u0C7F]/.test(
+    String(value)
+  );
+}
+
+
+// ============================================================
+// QUESTION ANSWER VALIDATION
+// ============================================================
+
+function validateQuestionAnswer(
+  answer
+) {
+
+  const value =
+    String(answer || '')
+      .trim();
+
+
+  if (!value) {
+
+    throw new Error(
+      'question.answer cannot be empty.'
+    );
+  }
+
+
+  /*
+   * If the answer contains Telugu,
+   * it is valid.
+   */
+  if (
+    containsTelugu(value)
+  ) {
+
+    return;
+  }
+
+
+  /*
+   * Pure numeric / mathematical answers
+   * are also valid.
+   *
+   * Examples:
+   *
+   * 42
+   * 3.14
+   * 100%
+   * 25°C
+   * 2:1
+   * 10²
+   * 5 + 5 = 10
+   *
+   * Unicode mathematical symbols and numbers
+   * are allowed.
+   */
+  const numericAnswerPattern =
+    /^[\d\s.,:%+\-×÷=()\/*^²³⁴⁵⁶⁷⁸⁹⁰°℃℉≤≥<>]+$/u;
+
+
+  if (
+    numericAnswerPattern.test(value)
+  ) {
+
+    return;
+  }
+
+
+  /*
+   * If it contains Latin alphabet characters,
+   * it is an English/Latin answer and should fail.
+   *
+   * The generation loop will then retry with a correction.
+   */
+  if (
+    /[A-Za-z]/.test(value)
+  ) {
+
+    throw new Error(
+      'question.answer contains non-Telugu Latin text. Write the answer in Telugu, or use only a pure numerical/mathematical answer.'
+    );
+  }
+
+
+  /*
+   * Any other non-Telugu answer is rejected
+   * rather than silently publishing uncertain content.
+   */
+  throw new Error(
+    'question.answer must contain Telugu text or be a pure numerical/mathematical answer.'
+  );
+}
+
+
+// ============================================================
+// FORBIDDEN TEXT
+// ============================================================
+
+function validateForbiddenText(
+  text
+) {
+
+  const forbidden = [
+
     {
       pattern: /```/,
-      message: 'Markdown code fences are not allowed.'
+      message:
+        'Markdown code fences are not allowed.'
     },
 
     {
       pattern: /https?:\/\//i,
-      message: 'URLs are not allowed.'
+      message:
+        'URLs are not allowed.'
     },
 
     {
       pattern: /\bwww\./i,
-      message: 'Web addresses are not allowed.'
+      message:
+        'Web addresses are not allowed.'
     },
 
     {
       pattern: /###/,
-      message: 'Markdown headings are not allowed.'
+      message:
+        'Markdown headings are not allowed.'
     }
+
   ];
 
-  for (const item of forbiddenPatterns) {
-    if (item.pattern.test(text)) {
+
+  for (
+    const item of forbidden
+  ) {
+
+    if (
+      item.pattern.test(text)
+    ) {
+
       throw new Error(
         item.message
       );
@@ -1449,7 +1960,7 @@ function validateForbiddenText(text) {
 
 
 // ============================================================
-// LENGTH VALIDATION
+// LENGTH
 // ============================================================
 
 function validateLength(
@@ -1457,46 +1968,287 @@ function validateLength(
   value,
   max
 ) {
-  const length =
-    [...value].length;
 
-  if (length > max) {
+  const length =
+    [...String(value)].length;
+
+
+  if (
+    length > max
+  ) {
+
     throw new Error(
-      `${field} is too long. ` +
-      `Maximum ${max} characters; received ${length}.`
+      `${field} is too long. Maximum ${max} characters; received ${length}.`
     );
   }
 }
 
 
 // ============================================================
-// TELUGU DETECTION
+// RECENT CONTENT
 // ============================================================
 
-function containsTelugu(value) {
-  /*
-   * Telugu Unicode block:
-   * U+0C00 - U+0C7F
-   */
-  return /[\u0C00-\u0C7F]/.test(value);
+function readRecentContent() {
+
+  if (
+    !fs.existsSync(
+      DATA_DIR
+    )
+  ) {
+
+    return '';
+  }
+
+
+  let files;
+
+
+  try {
+
+    files =
+      fs.readdirSync(
+        DATA_DIR
+      )
+      .filter(
+        file =>
+          /^\d{4}-\d{2}-\d{2}\.json$/
+            .test(file)
+      )
+      .sort()
+      .reverse()
+      .slice(
+        0,
+        MAX_RECENT_FILES
+      );
+
+  } catch (error) {
+
+    console.warn(
+      `Could not read recent content: ${error.message}`
+    );
+
+    return '';
+  }
+
+
+  if (
+    files.length === 0
+  ) {
+
+    return '';
+  }
+
+
+  const recent = [];
+
+
+  for (
+    const file of files
+  ) {
+
+    try {
+
+      const filePath =
+        path.join(
+          DATA_DIR,
+          file
+        );
+
+
+      const raw =
+        fs.readFileSync(
+          filePath,
+          'utf8'
+        );
+
+
+      const data =
+        JSON.parse(
+          raw
+        );
+
+
+      recent.push({
+
+        date:
+          data.date ||
+          file.replace(
+            '.json',
+            ''
+          ),
+
+        culture:
+          data.culture
+            ? {
+                title:
+                  data.culture.title,
+
+                content:
+                  data.culture.content
+              }
+            : null,
+
+        quote:
+          data.quote
+            ? {
+                title:
+                  data.quote.title,
+
+                content:
+                  data.quote.content
+              }
+            : null,
+
+        health:
+          data.health
+            ? {
+                title:
+                  data.health.title,
+
+                content:
+                  data.health.content
+              }
+            : null,
+
+        science:
+          data.science
+            ? {
+                title:
+                  data.science.title,
+
+                content:
+                  data.science.content
+              }
+            : null,
+
+        knowledge:
+          data.knowledge
+            ? {
+                title:
+                  data.knowledge.title,
+
+                content:
+                  data.knowledge.content
+              }
+            : null,
+
+        question:
+          data.question
+            ? {
+                question:
+                  data.question.question,
+
+                answer:
+                  data.question.answer
+              }
+            : null
+
+      });
+
+
+    } catch (error) {
+
+      console.warn(
+        `Skipping invalid recent file ${file}: ${error.message}`
+      );
+    }
+  }
+
+
+  if (
+    recent.length === 0
+  ) {
+
+    return '';
+  }
+
+
+  return JSON.stringify(
+    recent,
+    null,
+    2
+  );
 }
 
 
 // ============================================================
-// DATE / TIME
+// RETRY DELAY
+// ============================================================
+
+function getRetryDelay(
+  error,
+  attempt
+) {
+
+  const status =
+    error?.status;
+
+
+  if (
+    status === 429
+  ) {
+
+    return (
+      15000 +
+      Math.floor(
+        Math.random() * 5000
+      )
+    ) * attempt;
+  }
+
+
+  if (
+    status === 408 ||
+    status === 409 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    error?.retryable
+  ) {
+
+    return (
+      5000 * attempt
+    ) +
+    Math.floor(
+      Math.random() * 2000
+    );
+  }
+
+
+  /*
+   * Validation errors also get a short retry.
+   */
+  return (
+    3000 * attempt
+  );
+}
+
+
+// ============================================================
+// DATE
 // ============================================================
 
 function getIndiaDate() {
+
   const formatter =
     new Intl.DateTimeFormat(
       'en-CA',
       {
-        timeZone: 'Asia/Kolkata',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
+        timeZone:
+          'Asia/Kolkata',
+
+        year:
+          'numeric',
+
+        month:
+          '2-digit',
+
+        day:
+          '2-digit'
       }
     );
+
 
   return formatter.format(
     new Date()
@@ -1504,13 +2256,19 @@ function getIndiaDate() {
 }
 
 
-function isValidDate(value) {
+function isValidDate(
+  value
+) {
+
   const match =
-    /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    /^(\d{4})-(\d{2})-(\d{2})$/
+      .exec(value);
+
 
   if (!match) {
     return false;
   }
+
 
   const year =
     Number(match[1]);
@@ -1521,6 +2279,7 @@ function isValidDate(value) {
   const day =
     Number(match[3]);
 
+
   const date =
     new Date(
       Date.UTC(
@@ -1530,10 +2289,18 @@ function isValidDate(value) {
       )
     );
 
+
   return (
-    date.getUTCFullYear() === year &&
-    date.getUTCMonth() === month - 1 &&
-    date.getUTCDate() === day
+
+    date.getUTCFullYear() ===
+      year &&
+
+    date.getUTCMonth() ===
+      month - 1 &&
+
+    date.getUTCDate() ===
+      day
+
   );
 }
 
@@ -1543,7 +2310,13 @@ function isValidDate(value) {
 // ============================================================
 
 function ensureDataDirectory() {
-  if (!fs.existsSync(DATA_DIR)) {
+
+  if (
+    !fs.existsSync(
+      DATA_DIR
+    )
+  ) {
+
     fs.mkdirSync(
       DATA_DIR,
       {
@@ -1555,18 +2328,45 @@ function ensureDataDirectory() {
 
 
 // ============================================================
+// HEADER
+// ============================================================
+
+function printHeader() {
+
+  console.log('');
+  console.log('========================================');
+  console.log('VIDHWAAN DAILY SOCIAL');
+  console.log('Daily Content Generator');
+  console.log('========================================');
+  console.log(`Date: ${TARGET_DATE}`);
+  console.log(`Model: ${MODEL}`);
+  console.log('Timezone: Asia/Kolkata');
+  console.log('========================================');
+}
+
+
+// ============================================================
 // UTILITIES
 // ============================================================
 
-function sleep(ms) {
+function sleep(
+  ms
+) {
+
   return new Promise(
     resolve =>
-      setTimeout(resolve, ms)
+      setTimeout(
+        resolve,
+        ms
+      )
   );
 }
 
 
-function fail(message) {
+function fail(
+  message
+) {
+
   console.error('');
   console.error('========================================');
   console.error('GENERATION FAILED');
@@ -1579,22 +2379,25 @@ function fail(message) {
 
 
 // ============================================================
-// GLOBAL ERROR HANDLING
+// GLOBAL ERRORS
 // ============================================================
 
 process.on(
   'unhandledRejection',
   error => {
+
     fail(
       error?.message ||
       String(error)
     );
   }
 );
+
 
 process.on(
   'uncaughtException',
   error => {
+
     fail(
       error?.message ||
       String(error)
@@ -1604,11 +2407,12 @@ process.on(
 
 
 // ============================================================
-// RUN
+// START
 // ============================================================
 
 main().catch(
   error => {
+
     fail(
       error?.message ||
       String(error)
