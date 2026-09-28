@@ -2,14 +2,13 @@ name: Generate Vidhwaan Daily Social Content
 
 on:
   schedule:
-    # 1:00 AM every day in India Standard Time.
     - cron: "0 1 * * *"
       timezone: "Asia/Kolkata"
 
   workflow_dispatch:
     inputs:
       target_date:
-        description: "Optional date to generate (YYYY-MM-DD). Leave empty for the current India date."
+        description: "Optional date in YYYY-MM-DD format. Leave empty for today's India date."
         required: false
         type: string
 
@@ -17,7 +16,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: vidhwaan-daily-content
+  group: vidhwaan-daily-social-content
   cancel-in-progress: false
 
 jobs:
@@ -32,25 +31,17 @@ jobs:
       GROQ_MODEL: openai/gpt-oss-120b
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Checkout repository
-      # ------------------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ------------------------------------------------------------
-      # 2. Configure Git identity
-      # ------------------------------------------------------------
       - name: Configure Git
         run: |
           git config user.name "Vidhwaan Daily Social"
           git config user.email "actions@users.noreply.github.com"
 
-      # ------------------------------------------------------------
-      # 3. Determine the India publication date
-      # ------------------------------------------------------------
       - name: Determine publication date
         id: date
         shell: bash
@@ -64,33 +55,29 @@ jobs:
           fi
 
           if ! [[ "$TARGET_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            echo "ERROR: Invalid date format: $TARGET_DATE"
-            echo "Expected YYYY-MM-DD"
+            echo "ERROR: Invalid date: $TARGET_DATE"
+            echo "Expected format: YYYY-MM-DD"
             exit 1
           fi
 
-          if ! date -u -d "$TARGET_DATE" '+%Y-%m-%d' >/dev/null 2>&1; then
+          if ! date -d "$TARGET_DATE" '+%Y-%m-%d' >/dev/null 2>&1; then
             echo "ERROR: Invalid calendar date: $TARGET_DATE"
             exit 1
           fi
 
           echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
 
+          echo "========================================"
+          echo "Vidhwaan Daily Social"
           echo "Publication date: $TARGET_DATE"
           echo "Timezone: Asia/Kolkata"
+          echo "========================================"
 
-      # ------------------------------------------------------------
-      # 4. Prepare data directory
-      # ------------------------------------------------------------
-      - name: Prepare data directory
+      - name: Create data directory
         run: |
-          set -euo pipefail
           mkdir -p data
 
-      # ------------------------------------------------------------
-      # 5. Do not regenerate an already-published day
-      # ------------------------------------------------------------
-      - name: Check existing daily JSON
+      - name: Check whether today's JSON already exists
         id: existing
         shell: bash
         run: |
@@ -101,68 +88,55 @@ jobs:
 
           if [ -f "$TARGET_FILE" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Today's content already exists:"
-            echo "$TARGET_FILE"
+            echo "Already exists: $TARGET_FILE"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "No existing content found for $TARGET_DATE."
+            echo "No existing JSON for $TARGET_DATE"
           fi
 
-      # ------------------------------------------------------------
-      # 6. Stop safely if today's content already exists
-      # ------------------------------------------------------------
-      - name: Skip existing publication
+      - name: Stop because today's content already exists
         if: steps.existing.outputs.exists == 'true'
         run: |
-          echo "Daily content already published."
-          echo "Nothing to generate."
-          exit 0
+          echo "Today's Vidhwaan Daily Social content already exists."
+          echo "No new generation is required."
 
-      # ------------------------------------------------------------
-      # 7. Generate recent-content context
-      # ------------------------------------------------------------
       - name: Build recent content context
+        if: steps.existing.outputs.exists != 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          TARGET_DATE="${{ steps.date.outputs.target_date }}"
           CONTEXT_FILE="/tmp/recent-content.txt"
 
-          : > "$CONTEXT_FILE"
+          printf '%s\n' \
+            "Recent Vidhwaan Daily Social topics:" \
+            "" \
+            > "$CONTEXT_FILE"
 
-          echo "Recent Vidhwaan Daily Social topics:" >> "$CONTEXT_FILE"
-          echo "" >> "$CONTEXT_FILE"
-
-          mapfile -t RECENT_FILES < <(
-            find data \
-              -maxdepth 1 \
-              -type f \
-              -name '*.json' \
-              -printf '%f\n' |
+          find data \
+            -maxdepth 1 \
+            -type f \
+            -name '*.json' \
+            -printf '%f\n' |
             sort -r |
-            head -n 14
-          )
-
-          if [ "${#RECENT_FILES[@]}" -eq 0 ]; then
-            echo "No previous daily content is available." >> "$CONTEXT_FILE"
-          else
-            for FILE in "${RECENT_FILES[@]}"; do
-              FULL_PATH="data/$FILE"
+            head -n 14 |
+            while read -r FILE; do
 
               echo "--- $FILE ---" >> "$CONTEXT_FILE"
 
-              python3 - "$FULL_PATH" >> "$CONTEXT_FILE" <<'PY'
+              python3 - "$FILE" <<'PY' >> "$CONTEXT_FILE"
 import json
 import sys
+from pathlib import Path
 
-path = sys.argv[1]
+filename = sys.argv[1]
+path = Path("data") / filename
 
 try:
-    with open(path, "r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    sections = [
+    items = [
         ("culture", "title"),
         ("quote", "title"),
         ("health", "title"),
@@ -171,25 +145,27 @@ try:
         ("question", "question"),
     ]
 
-    for section, field in sections:
-        value = data.get(section, {}).get(field, "")
-        if isinstance(value, str) and value.strip():
-            print(f"{section}: {value.strip()}")
+    for section, field in items:
+        section_data = data.get(section, {})
+
+        if isinstance(section_data, dict):
+            value = section_data.get(field, "")
+
+            if isinstance(value, str) and value.strip():
+                print(f"{section}: {value.strip()}")
 
 except Exception as exc:
-    print(f"Could not read {path}: {exc}")
+    print(f"Could not read {filename}: {exc}")
 PY
 
               echo "" >> "$CONTEXT_FILE"
+
             done
-          fi
 
-          echo "Recent-content context prepared."
+          echo "Recent content context created."
 
-      # ------------------------------------------------------------
-      # 8. Generate six sections with Groq
-      # ------------------------------------------------------------
-      - name: Generate daily content with Groq
+      - name: Generate six daily posts with Groq
+        if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
         shell: python
@@ -202,163 +178,174 @@ PY
           import urllib.request
 
           api_key = os.environ.get("GROQ_API_KEY", "").strip()
-          model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+          model = os.environ.get(
+              "GROQ_MODEL",
+              "openai/gpt-oss-120b"
+          )
           target_date = os.environ["TARGET_DATE"]
 
           if not api_key:
-              print("ERROR: GROQ_API_KEY GitHub Secret is not configured.")
+              print("ERROR: GROQ_API_KEY secret is missing.")
               sys.exit(1)
 
-          with open("/tmp/recent-content.txt", "r", encoding="utf-8") as f:
-              recent_context = f.read().strip()
+          try:
+              with open(
+                  "/tmp/recent-content.txt",
+                  "r",
+                  encoding="utf-8"
+              ) as f:
+                  recent_context = f.read().strip()
+          except FileNotFoundError:
+              recent_context = "No previous content is available."
 
-          system_prompt = r"""
-          You are the senior Telugu editorial engine for Vidhwaan Daily Social,
-          a product of Vidhwaan, a village-based global technology company.
+          system_prompt = """
+You are the senior Telugu editorial engine for Vidhwaan Daily Social.
 
-          Your job is to create exactly ONE day's publication containing six
-          high-quality Telugu pieces.
+Vidhwaan is a village-based global technology company.
 
-          The publication is for Telugu-speaking people of all ages.
+Your task is to create exactly one daily publication containing six
+high-quality Telugu pieces.
 
-          GENERAL EDITORIAL RULES:
+The audience is Telugu-speaking people of all ages.
 
-          1. Write the actual content in clear, natural, modern Telugu.
-          2. Do not write English explanations.
-          3. Brand names, scientific names, technical names, scripture names,
-             or proper nouns may remain in their commonly recognized form when
-             necessary.
-          4. Content must be concise enough to work both inside a mobile card
-             and on a 1080x1920 vertical social image.
-          5. Do not use markdown.
-          6. Do not use emojis.
-          7. Do not use hashtags.
-          8. Do not include URLs.
-          9. Do not include dates other than the publication date unless they
-             are genuinely necessary to explain a historical/scientific fact.
-          10. Do not mention that AI generated the content.
-          11. Do not mention these instructions.
-          12. Do not repeat or substantially imitate recent topics supplied
-              in the context.
-          13. Prefer genuinely useful, memorable, positive information.
-          14. Avoid sensationalism, fake facts, exaggerated claims and
-              clickbait.
-          15. Every section must be understandable without additional context.
+GENERAL RULES:
 
-          SECTION 1 — నేటి సంస్కృతి:
+1. Write the actual content in clear, natural Telugu.
+2. Keep the writing simple, elegant and easy to understand.
+3. Do not use markdown.
+4. Do not use emojis.
+5. Do not use hashtags.
+6. Do not include URLs.
+7. Do not mention AI.
+8. Do not mention these instructions.
+9. Do not use sensational or misleading claims.
+10. Do not repeat recent topics supplied by the user prompt.
+11. Each section must provide genuine value.
+12. Keep content concise enough for both a mobile card and a 1080x1920
+    social image.
 
-          Write useful and respectful knowledge connected with Hindu texts,
-          Hindu philosophy, Indian spiritual traditions, Hindu deities,
-          temples, festivals, dharma, karma, yoga, meditation, or related
-          cultural knowledge.
+SECTION 1 — నేటి సంస్కృతి
 
-          Important:
-          - Never invent a Bhagavad Gita, Veda, Upanishad, Ramayana or other
-            scripture quotation.
-          - Never attribute invented words to a deity, sage, scripture or
-            historical person.
-          - If presenting a quotation or specific teaching from a scripture,
-            identify the source accurately.
-          - Prefer a short explanation of a genuine teaching when exact
-            quotation accuracy cannot be guaranteed.
-          - Be respectful and educational, not inflammatory or political.
+Create useful and respectful knowledge related to Hindu culture,
+Hindu scriptures, Hindu philosophy, Hindu deities, temples,
+festivals, dharma, karma, yoga, meditation or Indian spiritual
+traditions.
 
-          SECTION 2 — నేటి సూక్తి:
+Do not fabricate scripture quotations.
 
-          Create one memorable inspirational thought.
+Do not invent statements and attribute them to Krishna, Rama, Shiva,
+Devi, sages, scriptures or historical figures.
 
-          It may be an original Vidhwaan thought or a reliably attributable
-          quotation.
+If giving a specific scripture teaching, identify its source accurately.
 
-          Never invent attribution.
+Prefer a short explanation when exact quotation accuracy is uncertain.
 
-          If it is an original Vidhwaan thought, attribution should be:
-          "Vidhwaan"
+Keep this educational and respectful.
 
-          The title should be short and memorable.
+SECTION 2 — నేటి సూక్తి
 
-          SECTION 3 — నేటి ఆరోగ్యం:
+Create one memorable inspirational thought.
 
-          Provide general, evidence-aligned health education useful in daily
-          life.
+It may be an original Vidhwaan thought or a reliably attributable
+quotation.
 
-          Examples include sleep, physical activity, nutrition, hydration,
-          hygiene, eye care, dental care, healthy routines and general
-          wellbeing.
+Never invent attribution.
 
-          Never diagnose a person.
-          Never prescribe medication.
-          Never claim that a simple habit cures a disease.
-          Never recommend stopping prescribed treatment.
-          Avoid dangerous medical instructions.
-          Use sensible, conservative wording.
+If it is an original Vidhwaan thought, attribution must be:
+Vidhwaan
 
-          SECTION 4 — నేటి విజ్ఞానం:
+SECTION 3 — నేటి ఆరోగ్యం
 
-          Provide one scientifically accurate and genuinely interesting fact
-          or explanation.
+Provide general health education useful in everyday life.
 
-          Possible areas include astronomy, physics, biology, chemistry,
-          Earth science, animals, plants, the human body, oceans, climate,
-          computing, artificial intelligence and technology.
+Possible subjects include sleep, physical activity, hydration,
+nutrition, hygiene, eye care, dental care and healthy routines.
 
-          Clearly distinguish established scientific knowledge from uncertainty.
-          Do not present myths or speculation as scientific fact.
+Do not diagnose diseases.
 
-          SECTION 5 — నేటి జ్ఞానం:
+Do not prescribe medicines.
 
-          Provide one useful and interesting piece of general knowledge from
-          any area of the world.
+Do not claim that a simple habit cures a disease.
 
-          Possible areas include history, geography, languages, mathematics,
-          inventions, architecture, agriculture, cultures, countries,
-          everyday phenomena and interesting facts.
+Do not advise stopping prescribed treatment.
 
-          The reader should feel that they learned something genuinely useful
-          or surprising.
+Use conservative, responsible language.
 
-          SECTION 6 — నేటి ప్రశ్న:
+SECTION 4 — నేటి విజ్ఞానం
 
-          Create one enjoyable thinking question.
+Create one scientifically accurate and interesting explanation.
 
-          It may be a logic puzzle, reasoning problem, observation question,
-          mathematical puzzle, science reasoning question or lateral-thinking
-          problem.
+Possible subjects include space, Earth, physics, biology, chemistry,
+animals, plants, the human body, oceans, climate, computing,
+artificial intelligence and technology.
 
-          Requirements:
-          - The question must be understandable.
-          - It must have a definite answer.
-          - The answer must actually solve the question.
-          - Do not make it dependent on obscure trivia.
-          - Give the reader enough information to solve it.
-          - The answer should be satisfying and clearly explained.
+Do not present myths or speculation as established science.
 
-          FINAL QUALITY:
+SECTION 5 — నేటి జ్ఞానం
 
-          The six sections should feel different from one another.
-          Do not make every section motivational.
-          Do not make every science item about space.
-          Do not make every culture item about the same deity.
-          Do not make every question the same kind of riddle.
-          """
-          
+Create one useful and interesting general-knowledge item.
+
+Possible subjects include history, geography, languages, mathematics,
+inventions, architecture, agriculture, countries, cultures and
+interesting everyday facts.
+
+The reader should learn something genuinely useful or interesting.
+
+SECTION 6 — నేటి ప్రశ్న
+
+Create one enjoyable thinking question.
+
+It can be a logic puzzle, reasoning problem, mathematics puzzle,
+observation problem, science reasoning problem or lateral-thinking
+problem.
+
+The question must contain enough information to solve it.
+
+It must have a definite answer.
+
+The answer must actually solve the question.
+
+Do not depend on obscure trivia.
+
+The answer should be clearly explained.
+
+QUALITY:
+
+Make the six sections substantially different.
+
+Do not make every culture post about the same deity.
+
+Do not make every science post about space.
+
+Do not make every quote generic.
+
+Do not make every question the same type of riddle.
+"""
+
           user_prompt = f"""
-          Create the Vidhwaan Daily Social publication for:
+Create the Vidhwaan Daily Social publication for:
 
-          DATE: {target_date}
+DATE: {target_date}
 
-          The six sections must be fresh and substantially different from
-          the recent topics below.
+All six sections must be fresh.
 
-          RECENT CONTENT:
-          {recent_context}
+Avoid repeating or substantially copying the recent topics listed below.
 
-          Generate exactly one item for each of these six sections:
-          culture, quote, health, science, knowledge, question.
+RECENT CONTENT:
 
-          Keep the main content concise and highly shareable while still
-          providing real value.
-          """
+{recent_context}
+
+Generate exactly:
+
+1. culture
+2. quote
+3. health
+4. science
+5. knowledge
+6. question
+
+All actual content must be in Telugu.
+"""
 
           schema = {
               "type": "object",
@@ -375,10 +362,18 @@ PY
                   "culture": {
                       "type": "object",
                       "properties": {
-                          "heading": {"type": "string"},
-                          "title": {"type": "string"},
-                          "content": {"type": "string"},
-                          "source": {"type": "string"}
+                          "heading": {
+                              "type": "string"
+                          },
+                          "title": {
+                              "type": "string"
+                          },
+                          "content": {
+                              "type": "string"
+                          },
+                          "source": {
+                              "type": "string"
+                          }
                       },
                       "required": [
                           "heading",
@@ -391,10 +386,18 @@ PY
                   "quote": {
                       "type": "object",
                       "properties": {
-                          "heading": {"type": "string"},
-                          "title": {"type": "string"},
-                          "content": {"type": "string"},
-                          "attribution": {"type": "string"}
+                          "heading": {
+                              "type": "string"
+                          },
+                          "title": {
+                              "type": "string"
+                          },
+                          "content": {
+                              "type": "string"
+                          },
+                          "attribution": {
+                              "type": "string"
+                          }
                       },
                       "required": [
                           "heading",
@@ -407,9 +410,15 @@ PY
                   "health": {
                       "type": "object",
                       "properties": {
-                          "heading": {"type": "string"},
-                          "title": {"type": "string"},
-                          "content": {"type": "string"}
+                          "heading": {
+                              "type": "string"
+                          },
+                          "title": {
+                              "type": "string"
+                          },
+                          "content": {
+                              "type": "string"
+                          }
                       },
                       "required": [
                           "heading",
@@ -421,9 +430,15 @@ PY
                   "science": {
                       "type": "object",
                       "properties": {
-                          "heading": {"type": "string"},
-                          "title": {"type": "string"},
-                          "content": {"type": "string"}
+                          "heading": {
+                              "type": "string"
+                          },
+                          "title": {
+                              "type": "string"
+                          },
+                          "content": {
+                              "type": "string"
+                          }
                       },
                       "required": [
                           "heading",
@@ -435,9 +450,15 @@ PY
                   "knowledge": {
                       "type": "object",
                       "properties": {
-                          "heading": {"type": "string"},
-                          "title": {"type": "string"},
-                          "content": {"type": "string"}
+                          "heading": {
+                              "type": "string"
+                          },
+                          "title": {
+                              "type": "string"
+                          },
+                          "content": {
+                              "type": "string"
+                          }
                       },
                       "required": [
                           "heading",
@@ -449,9 +470,15 @@ PY
                   "question": {
                       "type": "object",
                       "properties": {
-                          "heading": {"type": "string"},
-                          "question": {"type": "string"},
-                          "answer": {"type": "string"}
+                          "heading": {
+                              "type": "string"
+                          },
+                          "question": {
+                              "type": "string"
+                          },
+                          "answer": {
+                              "type": "string"
+                          }
                       },
                       "required": [
                           "heading",
@@ -499,49 +526,92 @@ PY
               "max_completion_tokens": 6000
           }
 
-          request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+          request_data = json.dumps(
+              payload,
+              ensure_ascii=False
+          ).encode("utf-8")
 
-          url = "https://api.groq.com/openai/v1/chat/completions"
+          request_url = (
+              "https://api.groq.com/openai/v1/chat/completions"
+          )
 
           headers = {
               "Authorization": f"Bearer {api_key}",
               "Content-Type": "application/json",
               "Accept": "application/json",
-              "User-Agent": "Vidhwaan-Daily-Social-GitHub-Action"
+              "User-Agent": "Vidhwaan-Daily-Social"
           }
 
           max_attempts = 3
-          result = None
+          response_data = None
 
           for attempt in range(1, max_attempts + 1):
-              print(f"Groq request attempt {attempt}/{max_attempts}...")
+
+              print(
+                  f"Groq request attempt "
+                  f"{attempt}/{max_attempts}..."
+              )
 
               request = urllib.request.Request(
-                  url,
-                  data=request_body,
+                  request_url,
+                  data=request_data,
                   headers=headers,
                   method="POST"
               )
 
               try:
-                  with urllib.request.urlopen(request, timeout=300) as response:
-                      raw = response.read().decode("utf-8")
-                      result = json.loads(raw)
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=300
+                  ) as response:
+
+                      response_text = (
+                          response.read()
+                          .decode("utf-8")
+                      )
+
+                      response_data = json.loads(
+                          response_text
+                      )
+
                       break
 
               except urllib.error.HTTPError as exc:
-                  error_body = exc.read().decode("utf-8", errors="replace")
 
-                  print(f"Groq HTTP error: {exc.code}")
-                  print(error_body[:4000])
+                  error_text = exc.read().decode(
+                      "utf-8",
+                      errors="replace"
+                  )
 
-                  retryable = exc.code in {408, 409, 429, 500, 502, 503, 504}
+                  print(
+                      f"Groq HTTP error: {exc.code}"
+                  )
 
-                  if not retryable or attempt == max_attempts:
+                  print(error_text[:5000])
+
+                  retryable_codes = {
+                      408,
+                      409,
+                      429,
+                      500,
+                      502,
+                      503,
+                      504
+                  }
+
+                  if (
+                      exc.code not in retryable_codes
+                      or attempt == max_attempts
+                  ):
                       sys.exit(1)
 
                   wait_seconds = 30 * attempt
-                  print(f"Retrying in {wait_seconds} seconds...")
+
+                  print(
+                      f"Retrying in "
+                      f"{wait_seconds} seconds..."
+                  )
+
                   time.sleep(wait_seconds)
 
               except (
@@ -549,52 +619,82 @@ PY
                   TimeoutError,
                   ConnectionError
               ) as exc:
-                  print(f"Groq connection error: {exc}")
+
+                  print(
+                      f"Connection error: {exc}"
+                  )
 
                   if attempt == max_attempts:
                       sys.exit(1)
 
                   wait_seconds = 30 * attempt
-                  print(f"Retrying in {wait_seconds} seconds...")
+
+                  print(
+                      f"Retrying in "
+                      f"{wait_seconds} seconds..."
+                  )
+
                   time.sleep(wait_seconds)
 
-          if result is None:
-              print("ERROR: No response received from Groq.")
+          if response_data is None:
+              print("ERROR: Groq returned no response.")
               sys.exit(1)
 
           try:
-              content = result["choices"][0]["message"]["content"]
-          except (KeyError, IndexError, TypeError):
-              print("ERROR: Unexpected Groq response:")
-              print(json.dumps(result, ensure_ascii=False, indent=2)[:10000])
+              generated_text = (
+                  response_data["choices"][0]
+                  ["message"]["content"]
+              )
+          except (
+              KeyError,
+              IndexError,
+              TypeError
+          ):
+              print("ERROR: Unexpected Groq response.")
+              print(
+                  json.dumps(
+                      response_data,
+                      ensure_ascii=False,
+                      indent=2
+                  )[:10000]
+              )
               sys.exit(1)
 
-          if not isinstance(content, str) or not content.strip():
+          if (
+              not isinstance(generated_text, str)
+              or not generated_text.strip()
+          ):
               print("ERROR: Groq returned empty content.")
               sys.exit(1)
 
           try:
-              daily = json.loads(content)
+              daily_data = json.loads(
+                  generated_text
+              )
           except json.JSONDecodeError as exc:
-              print(f"ERROR: Groq content is not valid JSON: {exc}")
-              print(content[:10000])
+              print(
+                  f"ERROR: Generated content is not valid JSON: {exc}"
+              )
+              print(generated_text[:10000])
               sys.exit(1)
 
-          with open("/tmp/daily-generated.json", "w", encoding="utf-8") as f:
+          with open(
+              "/tmp/daily-generated.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
               json.dump(
-                  daily,
+                  daily_data,
                   f,
                   ensure_ascii=False,
                   indent=2
               )
               f.write("\n")
 
-          print("Groq generated the daily JSON successfully.")
+          print("Groq generation completed.")
 
-      # ------------------------------------------------------------
-      # 9. Validate generated content
-      # ------------------------------------------------------------
       - name: Validate generated JSON
+        if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
         shell: python
@@ -606,18 +706,31 @@ PY
           from pathlib import Path
 
           target_date = os.environ["TARGET_DATE"]
-          source = Path("/tmp/daily-generated.json")
-          output = Path("data") / f"{target_date}.json"
+
+          source = Path(
+              "/tmp/daily-generated.json"
+          )
+
+          output = Path(
+              "data"
+          ) / f"{target_date}.json"
 
           if not source.exists():
-              print("ERROR: Generated JSON file does not exist.")
+              print(
+                  "ERROR: Generated JSON does not exist."
+              )
               sys.exit(1)
 
           try:
-              with source.open("r", encoding="utf-8") as f:
+              with source.open(
+                  "r",
+                  encoding="utf-8"
+              ) as f:
                   data = json.load(f)
           except Exception as exc:
-              print(f"ERROR: Could not parse generated JSON: {exc}")
+              print(
+                  f"ERROR: Could not parse JSON: {exc}"
+              )
               sys.exit(1)
 
           required_top_level = [
@@ -634,70 +747,142 @@ PY
 
           for key in required_top_level:
               if key not in data:
-                  print(f"ERROR: Missing top-level field: {key}")
+                  print(
+                      f"ERROR: Missing field: {key}"
+                  )
                   sys.exit(1)
 
           if data["date"] != target_date:
               print(
-                  f"ERROR: Date mismatch. "
-                  f"Expected {target_date}, got {data['date']}"
+                  "ERROR: Date mismatch."
+              )
+              print(
+                  f"Expected: {target_date}"
+              )
+              print(
+                  f"Received: {data['date']}"
               )
               sys.exit(1)
 
           if data["language"] != "te":
               print(
-                  f"ERROR: Language must be 'te', got: "
-                  f"{data['language']!r}"
+                  "ERROR: language must be 'te'."
               )
               sys.exit(1)
 
           if data["publisher"] != "Vidhwaan":
               print(
-                  f"ERROR: Publisher must be 'Vidhwaan', got: "
-                  f"{data['publisher']!r}"
+                  "ERROR: publisher must be 'Vidhwaan'."
               )
               sys.exit(1)
 
-          section_rules = {
-              "culture": ["heading", "title", "content", "source"],
-              "quote": ["heading", "title", "content", "attribution"],
-              "health": ["heading", "title", "content"],
-              "science": ["heading", "title", "content"],
-              "knowledge": ["heading", "title", "content"],
-              "question": ["heading", "question", "answer"]
+          section_fields = {
+              "culture": [
+                  "heading",
+                  "title",
+                  "content",
+                  "source"
+              ],
+              "quote": [
+                  "heading",
+                  "title",
+                  "content",
+                  "attribution"
+              ],
+              "health": [
+                  "heading",
+                  "title",
+                  "content"
+              ],
+              "science": [
+                  "heading",
+                  "title",
+                  "content"
+              ],
+              "knowledge": [
+                  "heading",
+                  "title",
+                  "content"
+              ],
+              "question": [
+                  "heading",
+                  "question",
+                  "answer"
+              ]
           }
 
-          for section, fields in section_rules.items():
-              value = data.get(section)
+          for section, fields in section_fields.items():
 
-              if not isinstance(value, dict):
-                  print(f"ERROR: {section} must be an object.")
+              if not isinstance(
+                  data[section],
+                  dict
+              ):
+                  print(
+                      f"ERROR: {section} must be an object."
+                  )
                   sys.exit(1)
 
               for field in fields:
-                  if field not in value:
+
+                  if field not in data[section]:
                       print(
-                          f"ERROR: Missing field "
+                          f"ERROR: Missing "
                           f"{section}.{field}"
                       )
                       sys.exit(1)
 
-                  if not isinstance(value[field], str):
+                  value = data[section][field]
+
+                  if not isinstance(
+                      value,
+                      str
+                  ):
                       print(
-                          f"ERROR: {section}.{field} "
+                          f"ERROR: "
+                          f"{section}.{field} "
                           f"must be a string."
                       )
                       sys.exit(1)
 
-                  if not value[field].strip():
+                  if not value.strip():
                       print(
-                          f"ERROR: {section}.{field} "
-                          f"cannot be empty."
+                          f"ERROR: "
+                          f"{section}.{field} "
+                          f"is empty."
                       )
                       sys.exit(1)
 
-          # Telugu Unicode block.
-          telugu_pattern = re.compile(r"[\u0C00-\u0C7F]")
+          expected_headings = {
+              "culture": "నేటి సంస్కృతి",
+              "quote": "నేటి సూక్తి",
+              "health": "నేటి ఆరోగ్యం",
+              "science": "నేటి విజ్ఞానం",
+              "knowledge": "నేటి జ్ఞానం",
+              "question": "నేటి ప్రశ్న"
+          }
+
+          for section, expected in (
+              expected_headings.items()
+          ):
+
+              actual = data[section]["heading"].strip()
+
+              if actual != expected:
+                  print(
+                      f"ERROR: Incorrect heading for "
+                      f"{section}."
+                  )
+                  print(
+                      f"Expected: {expected}"
+                  )
+                  print(
+                      f"Received: {actual}"
+                  )
+                  sys.exit(1)
+
+          telugu_pattern = re.compile(
+              r"[\u0C00-\u0C7F]"
+          )
 
           text_fields = [
               ("culture", "title"),
@@ -715,73 +900,74 @@ PY
           ]
 
           for section, field in text_fields:
-              text = data[section][field]
 
-              if not telugu_pattern.search(text):
+              value = data[section][field]
+
+              if not telugu_pattern.search(value):
                   print(
-                      f"ERROR: {section}.{field} does not contain "
-                      f"Telugu Unicode text."
+                      f"ERROR: "
+                      f"{section}.{field} "
+                      f"contains no Telugu text."
                   )
                   sys.exit(1)
 
-          # Expected fixed headings.
-          expected_headings = {
-              "culture": "నేటి సంస్కృతి",
-              "quote": "నేటి సూక్తి",
-              "health": "నేటి ఆరోగ్యం",
-              "science": "నేటి విజ్ఞానం",
-              "knowledge": "నేటి జ్ఞానం",
-              "question": "నేటి ప్రశ్న"
-          }
-
-          for section, expected in expected_headings.items():
-              actual = data[section]["heading"].strip()
-
-              if actual != expected:
-                  print(
-                      f"ERROR: {section}.heading must be "
-                      f"{expected!r}, got {actual!r}"
-                  )
-                  sys.exit(1)
-
-          # Basic length protection.
-          limits = {
+          length_limits = {
               ("culture", "title"): 180,
               ("culture", "content"): 1200,
               ("culture", "source"): 300,
+
               ("quote", "title"): 180,
               ("quote", "content"): 600,
               ("quote", "attribution"): 200,
+
               ("health", "title"): 180,
               ("health", "content"): 1200,
+
               ("science", "title"): 180,
               ("science", "content"): 1200,
+
               ("knowledge", "title"): 180,
               ("knowledge", "content"): 1200,
+
               ("question", "question"): 800,
               ("question", "answer"): 1000
           }
 
-          for (section, field), maximum in limits.items():
+          for (
+              section,
+              field
+          ), maximum in length_limits.items():
+
               value = data[section][field]
 
               if len(value) > maximum:
                   print(
-                      f"ERROR: {section}.{field} is too long: "
-                      f"{len(value)} characters; maximum {maximum}."
+                      f"ERROR: "
+                      f"{section}.{field} is too long."
+                  )
+                  print(
+                      f"Length: {len(value)}"
+                  )
+                  print(
+                      f"Maximum: {maximum}"
                   )
                   sys.exit(1)
 
-          # Basic forbidden-format checks.
-          all_text = []
+          all_content = []
 
-          for section, fields in section_rules.items():
+          for section, fields in (
+              section_fields.items()
+          ):
               for field in fields:
-                  all_text.append(str(data[section][field]))
+                  all_content.append(
+                      data[section][field]
+                  )
 
-          combined = "\n".join(all_text)
+          combined = "\n".join(
+              all_content
+          )
 
-          forbidden_patterns = [
+          forbidden = [
               "```",
               "http://",
               "https://",
@@ -789,29 +975,44 @@ PY
               "###"
           ]
 
-          for pattern in forbidden_patterns:
+          for pattern in forbidden:
+
               if pattern in combined:
                   print(
-                      f"ERROR: Forbidden pattern found in content: "
-                      f"{pattern}"
+                      "ERROR: Forbidden pattern found:"
                   )
+                  print(pattern)
                   sys.exit(1)
 
-          # Remove any accidental unexpected top-level fields.
-          allowed_top_level = set(required_top_level)
-          unexpected = set(data.keys()) - allowed_top_level
+          allowed_top_level = set(
+              required_top_level
+          )
+
+          unexpected = (
+              set(data.keys())
+              - allowed_top_level
+          )
 
           if unexpected:
               print(
-                  "ERROR: Unexpected top-level fields: "
-                  + ", ".join(sorted(unexpected))
+                  "ERROR: Unexpected fields:"
+              )
+              print(
+                  ", ".join(
+                      sorted(unexpected)
+                  )
               )
               sys.exit(1)
 
-          # Normalize whitespace and write the final production JSON.
-          output.parent.mkdir(parents=True, exist_ok=True)
+          output.parent.mkdir(
+              parents=True,
+              exist_ok=True
+          )
 
-          with output.open("w", encoding="utf-8") as f:
+          with output.open(
+              "w",
+              encoding="utf-8"
+          ) as f:
               json.dump(
                   data,
                   f,
@@ -820,8 +1021,10 @@ PY
               )
               f.write("\n")
 
-          # Final parse check.
-          with output.open("r", encoding="utf-8") as f:
+          with output.open(
+              "r",
+              encoding="utf-8"
+          ) as f:
               json.load(f)
 
           print("")
@@ -834,10 +1037,8 @@ PY
           print("Sections: 6")
           print("========================================")
 
-      # ------------------------------------------------------------
-      # 10. Show generated content summary
-      # ------------------------------------------------------------
-      - name: Show publication summary
+      - name: Show generated publication
+        if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
         shell: python
@@ -845,9 +1046,15 @@ PY
           import json
           import os
 
-          path = f"data/{os.environ['TARGET_DATE']}.json"
+          path = (
+              f"data/{os.environ['TARGET_DATE']}.json"
+          )
 
-          with open(path, "r", encoding="utf-8") as f:
+          with open(
+              path,
+              "r",
+              encoding="utf-8"
+          ) as f:
               data = json.load(f)
 
           print("")
@@ -855,29 +1062,40 @@ PY
           print("=====================")
           print(f"Date: {data['date']}")
           print("")
-          print(f"1. {data['culture']['heading']}")
-          print(f"   {data['culture']['title']}")
-          print("")
-          print(f"2. {data['quote']['heading']}")
-          print(f"   {data['quote']['title']}")
-          print("")
-          print(f"3. {data['health']['heading']}")
-          print(f"   {data['health']['title']}")
-          print("")
-          print(f"4. {data['science']['heading']}")
-          print(f"   {data['science']['title']}")
-          print("")
-          print(f"5. {data['knowledge']['heading']}")
-          print(f"   {data['knowledge']['title']}")
-          print("")
-          print(f"6. {data['question']['heading']}")
-          print(f"   {data['question']['question']}")
+          print(
+              "1. "
+              f"{data['culture']['heading']}: "
+              f"{data['culture']['title']}"
+          )
+          print(
+              "2. "
+              f"{data['quote']['heading']}: "
+              f"{data['quote']['title']}"
+          )
+          print(
+              "3. "
+              f"{data['health']['heading']}: "
+              f"{data['health']['title']}"
+          )
+          print(
+              "4. "
+              f"{data['science']['heading']}: "
+              f"{data['science']['title']}"
+          )
+          print(
+              "5. "
+              f"{data['knowledge']['heading']}: "
+              f"{data['knowledge']['title']}"
+          )
+          print(
+              "6. "
+              f"{data['question']['heading']}: "
+              f"{data['question']['question']}"
+          )
           print("")
 
-      # ------------------------------------------------------------
-      # 11. Commit only today's generated JSON
-      # ------------------------------------------------------------
       - name: Commit daily JSON
+        if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
         shell: bash
@@ -893,12 +1111,12 @@ PY
             exit 0
           fi
 
-          git commit -m "Add Vidhwaan Daily Social content for ${TARGET_DATE}"
+          git commit \
+            -m "Add Vidhwaan Daily Social content for ${TARGET_DATE}"
 
-      # ------------------------------------------------------------
-      # 12. Push publication
-      # ------------------------------------------------------------
       - name: Push daily JSON
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
         run: |
           set -euo pipefail
 
