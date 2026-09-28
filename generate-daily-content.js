@@ -1,662 +1,298 @@
+'use strict';
+
 /*
- * Vidhwaan Daily Social
- * Production Daily Content Generator
- *
- * Generates exactly ONE daily JSON containing exactly FIVE cards:
- *
- * 1. నేటి సూక్తి
- * 2. నేటి ఆరోగ్యం
- * 3. నేటి విజ్ఞానం
- * 4. నేటి జ్ఞానం
- * 5. నేటి ప్రశ్న
+ * ============================================================
+ * VIDHWAAN DAILY SOCIAL
+ * Production Daily Telugu Content Generator
+ * ============================================================
  *
  * Model:
  *   openai/gpt-oss-120b
  *
- * API:
+ * Provider:
  *   Groq
  *
- * Production principles:
- *   - Accuracy before novelty
- *   - Conservative factual generation
- *   - Telugu-only user-facing content
- *   - Strict JSON Schema
- *   - One generation request for all five cards
- *   - Anti-repetition
- *   - Deterministic validation
- *   - Question verification
- *   - Safe health rules
- *   - No fabricated quotations
- *   - Never overwrite an existing daily JSON
- *   - Never publish failed content
+ * Output:
+ *   data/YYYY-MM-DD.json
+ *
+ * Environment:
+ *   GROQ_API_KEY
+ *   GROQ_MODEL   optional
+ *   TARGET_DATE  optional
+ *
+ * Production design:
+ *
+ *   1. Generate exactly five cards.
+ *   2. Strict JSON Schema.
+ *   3. Telugu user-facing content.
+ *   4. Anti-repetition using recent JSON files.
+ *   5. Deterministic validation.
+ *   6. Automatic retry on invalid content.
+ *   7. Automatic waiting when Groq token limits are reached.
+ *   8. Rate-limit waiting does NOT consume a generation attempt.
+ *   9. Never overwrite an existing daily JSON.
+ *  10. Atomic file publication.
+ *
+ * Cards:
+ *
+ *   quote
+ *   health
+ *   science
+ *   knowledge
+ *   question
+ *
+ * ============================================================
  */
 
-"use strict";
 
-const fs = require("fs");
-const path = require("path");
+// ============================================================
+// MODULES
+// ============================================================
 
-/* =========================================================
-   CONFIGURATION
-   ========================================================= */
+const fs = require('fs');
+const path = require('path');
 
-const GROQ_API_URL =
-  "https://api.groq.com/openai/v1/chat/completions";
 
-const GROQ_API_KEY =
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const API_URL =
+  'https://api.groq.com/openai/v1/chat/completions';
+
+const MODEL =
+  process.env.GROQ_MODEL ||
+  'openai/gpt-oss-120b';
+
+const API_KEY =
   process.env.GROQ_API_KEY;
 
-const GROQ_MODEL =
-  process.env.GROQ_MODEL ||
-  "openai/gpt-oss-120b";
-
-const TARGET_DATE =
-  process.env.TARGET_DATE ||
-  new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Kolkata",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).format(new Date());
-
-const DATA_DIRECTORY =
-  path.join(process.cwd(), "data");
-
-const OUTPUT_FILE =
+const DATA_DIR =
   path.join(
-    DATA_DIRECTORY,
-    `${TARGET_DATE}.json`
+    process.cwd(),
+    'data'
   );
 
 const MAX_RECENT_FILES = 14;
 
-const MAX_GENERATION_ATTEMPTS = 5;
-
-const REQUEST_TIMEOUT_MS = 120000;
-
 /*
- * Low temperature because this is factual/public content,
- * not creative fiction.
- */
-const TEMPERATURE = 0.15;
-
-/*
- * GPT-OSS supports reasoning effort.
+ * Genuine content-generation attempts.
  *
- * High reasoning is preferred because the task includes:
- * - factual caution
- * - five different editorial categories
- * - question reasoning
- * - anti-repetition
+ * Rate-limit waits do NOT consume this count.
  */
-const REASONING_EFFORT = "high";
+const MAX_ATTEMPTS = 5;
 
-/* =========================================================
-   BASIC ENVIRONMENT VALIDATION
-   ========================================================= */
+/*
+ * Initial completion budget.
+ *
+ * This is a maximum ceiling, not a request to consume
+ * the entire amount.
+ */
+const INITIAL_MAX_COMPLETION_TOKENS = 12000;
 
-if (!GROQ_API_KEY) {
-  console.error(
-    "ERROR: GROQ_API_KEY is not available."
-  );
+/*
+ * If Groq reports that the completion was truncated,
+ * subsequent attempts can use a larger budget.
+ */
+const LARGE_MAX_COMPLETION_TOKENS = 20000;
 
-  process.exit(1);
-}
+const REQUEST_TIMEOUT_MS = 180000;
 
-/* =========================================================
-   UTILITY FUNCTIONS
-   ========================================================= */
+/*
+ * Do not wait forever for one rate-limit window.
+ * The loop can continue across multiple windows, but this
+ * prevents a broken API response from hanging indefinitely.
+ */
+const MAX_RATE_WAIT_MS = 15 * 60 * 1000;
 
-function fail(message) {
-  throw new Error(message);
-}
+/*
+ * Small delay before retrying a normal validation failure.
+ */
+const VALIDATION_RETRY_DELAY_MS = 2500;
 
-function isObject(value) {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value)
-  );
-}
+const TARGET_DATE =
+  process.env.TARGET_DATE ||
+  getIndiaDate();
 
-function isNonEmptyString(value) {
-  return (
-    typeof value === "string" &&
-    value.trim().length > 0
-  );
-}
 
-function normalizeWhitespace(value) {
-  return String(value)
-    .replace(/\s+/g, " ")
-    .trim();
-}
+// ============================================================
+// STARTUP VALIDATION
+// ============================================================
 
-function hasTelugu(value) {
-  return (
-    typeof value === "string" &&
-    /[\u0C00-\u0C7F]/u.test(value)
+if (!API_KEY) {
+  fail(
+    'GROQ_API_KEY is missing. Add GROQ_API_KEY to GitHub repository secrets.'
   );
 }
 
-function hasLatinLetters(value) {
-  return (
-    typeof value === "string" &&
-    /[A-Za-z]/.test(value)
+if (!/^\d{4}-\d{2}-\d{2}$/.test(TARGET_DATE)) {
+  fail(
+    `Invalid TARGET_DATE: ${TARGET_DATE}. Expected YYYY-MM-DD.`
   );
 }
 
-function wordCount(value) {
-  return normalizeWhitespace(value)
-    .split(/\s+/)
-    .filter(Boolean)
-    .length;
-}
-
-function containsAny(value, patterns) {
-  const text =
-    String(value).toLowerCase();
-
-  return patterns.some((pattern) =>
-    text.includes(
-      String(pattern).toLowerCase()
-    )
+if (!isValidDate(TARGET_DATE)) {
+  fail(
+    `Invalid calendar date: ${TARGET_DATE}.`
   );
 }
 
-function normalizeForComparison(value) {
-  return normalizeWhitespace(value)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ");
-}
 
-function similarityScore(a, b) {
-  const aa = new Set(
-    normalizeForComparison(a)
-      .split(/\s+/)
-      .filter(Boolean)
-  );
+// ============================================================
+// MAIN
+// ============================================================
 
-  const bb = new Set(
-    normalizeForComparison(b)
-      .split(/\s+/)
-      .filter(Boolean)
-  );
+async function main() {
 
-  if (!aa.size || !bb.size) {
-    return 0;
-  }
+  printHeader();
 
-  let intersection = 0;
+  ensureDataDirectory();
 
-  for (const word of aa) {
-    if (bb.has(word)) {
-      intersection++;
-    }
-  }
-
-  const union =
-    new Set([
-      ...aa,
-      ...bb
-    ]).size;
-
-  return union
-    ? intersection / union
-    : 0;
-}
-
-/* =========================================================
-   DATE VALIDATION
-   ========================================================= */
-
-function validateDateString(date) {
-  if (
-    !/^\d{4}-\d{2}-\d{2}$/.test(date)
-  ) {
-    fail(
-      `Invalid date format: ${date}`
+  const outputFile =
+    path.join(
+      DATA_DIR,
+      `${TARGET_DATE}.json`
     );
-  }
 
-  const parsed =
-    new Date(`${date}T00:00:00Z`);
 
-  if (
-    Number.isNaN(
-      parsed.getTime()
-    )
-  ) {
-    fail(
-      `Invalid calendar date: ${date}`
+  // ----------------------------------------------------------
+  // NEVER OVERWRITE EXISTING DAILY FILE
+  // ----------------------------------------------------------
+
+  if (fs.existsSync(outputFile)) {
+
+    console.log('');
+    console.log(
+      'Daily JSON already exists.'
     );
-  }
 
-  if (
-    parsed.toISOString().slice(0, 10) !==
-    date
-  ) {
-    fail(
-      `Invalid calendar date: ${date}`
+    console.log(
+      `File: ${outputFile}`
     );
-  }
-}
 
-validateDateString(
-  TARGET_DATE
-);
-
-/* =========================================================
-   DATA DIRECTORY
-   ========================================================= */
-
-fs.mkdirSync(
-  DATA_DIRECTORY,
-  {
-    recursive: true
-  }
-);
-
-/* =========================================================
-   NEVER OVERWRITE EXISTING JSON
-   ========================================================= */
-
-if (
-  fs.existsSync(OUTPUT_FILE)
-) {
-  console.log(
-    "========================================"
-  );
-
-  console.log(
-    "VIDHWAAN DAILY SOCIAL"
-  );
-
-  console.log(
-    "Daily JSON already exists."
-  );
-
-  console.log(
-    `File: ${OUTPUT_FILE}`
-  );
-
-  console.log(
-    "No overwrite performed."
-  );
-
-  console.log(
-    "========================================"
-  );
-
-  process.exit(0);
-}
-
-/* =========================================================
-   RECENT DAILY JSON FILES
-   ========================================================= */
-
-function getRecentFiles() {
-  if (
-    !fs.existsSync(
-      DATA_DIRECTORY
-    )
-  ) {
-    return [];
-  }
-
-  return fs
-    .readdirSync(
-      DATA_DIRECTORY
-    )
-    .filter((file) =>
-      /^\d{4}-\d{2}-\d{2}\.json$/.test(file)
-    )
-    .filter(
-      (file) =>
-        file !== `${TARGET_DATE}.json`
-    )
-    .sort()
-    .reverse()
-    .slice(
-      0,
-      MAX_RECENT_FILES
+    console.log('');
+    console.log(
+      'Nothing to generate.'
     );
-}
 
-/* =========================================================
-   READ RECENT CONTENT
-   ========================================================= */
-
-function readRecentContent() {
-  const files =
-    getRecentFiles();
-
-  const recent = [];
-
-  for (const file of files) {
-    const fullPath =
-      path.join(
-        DATA_DIRECTORY,
-        file
-      );
-
-    try {
-      const raw =
-        fs.readFileSync(
-          fullPath,
-          "utf8"
-        );
-
-      const data =
-        JSON.parse(raw);
-
-      if (
-        !isObject(data)
-      ) {
-        continue;
-      }
-
-      recent.push({
-        date: data.date,
-
-        quote:
-          isObject(data.quote)
-            ? {
-                title:
-                  data.quote.title,
-                content:
-                  data.quote.content,
-                attribution:
-                  data.quote.attribution
-              }
-            : null,
-
-        health:
-          isObject(data.health)
-            ? {
-                title:
-                  data.health.title,
-                content:
-                  data.health.content
-              }
-            : null,
-
-        science:
-          isObject(data.science)
-            ? {
-                title:
-                  data.science.title,
-                content:
-                  data.science.content
-              }
-            : null,
-
-        knowledge:
-          isObject(data.knowledge)
-            ? {
-                title:
-                  data.knowledge.title,
-                content:
-                  data.knowledge.content
-              }
-            : null,
-
-        question:
-          isObject(data.question)
-            ? {
-                question:
-                  data.question.question,
-                answer:
-                  data.question.answer
-              }
-            : null
-      });
-
-    } catch (error) {
-      console.warn(
-        `WARNING: Could not read ${file}: ${error.message}`
-      );
-    }
+    return;
   }
 
-  return recent;
-}
 
-const recentContent =
-  readRecentContent();
+  // ----------------------------------------------------------
+  // RECENT CONTENT
+  // ----------------------------------------------------------
 
-/* =========================================================
-   RECENT CONTENT FOR MODEL
-   ========================================================= */
+  const recentContent =
+    readRecentContent();
 
-function buildRecentContent() {
-  if (
-    !recentContent.length
-  ) {
-    return (
-      "No previous daily content is available."
+
+  // ----------------------------------------------------------
+  // GENERATE
+  // ----------------------------------------------------------
+
+  const content =
+    await generateValidatedContent(
+      recentContent
     );
-  }
 
-  return recentContent
-    .map(
-      (item) =>
-        JSON.stringify(
-          item,
-          null,
-          2
-        )
-    )
-    .join("\n\n");
+
+  // ----------------------------------------------------------
+  // FINAL NORMALIZATION
+  // ----------------------------------------------------------
+
+  const finalContent =
+    normalizeFinalContent(
+      content
+    );
+
+
+  // ----------------------------------------------------------
+  // FINAL VALIDATION
+  // ----------------------------------------------------------
+
+  console.log('');
+  console.log(
+    'Running final production validation...'
+  );
+
+  validateContent(
+    finalContent
+  );
+
+
+  // ----------------------------------------------------------
+  // ATOMIC PUBLICATION
+  // ----------------------------------------------------------
+
+  await writeAtomicJson(
+    outputFile,
+    finalContent
+  );
+
+
+  // ----------------------------------------------------------
+  // VERIFY WRITTEN FILE
+  // ----------------------------------------------------------
+
+  verifyWrittenFile(
+    outputFile
+  );
+
+
+  // ----------------------------------------------------------
+  // SUCCESS
+  // ----------------------------------------------------------
+
+  console.log('');
+  console.log('========================================');
+  console.log('VIDHWAAN DAILY SOCIAL');
+  console.log('GENERATION SUCCESSFUL');
+  console.log('========================================');
+  console.log('');
+  console.log(
+    `Date: ${TARGET_DATE}`
+  );
+  console.log(
+    `File: ${outputFile}`
+  );
+  console.log(
+    `Cards: 5`
+  );
+  console.log('');
+  console.log(
+    'The daily JSON is ready for publication.'
+  );
 }
 
-/* =========================================================
-   STRICT JSON SCHEMA
-   ========================================================= */
 
-const RESPONSE_SCHEMA = {
-  type: "object",
+// ============================================================
+// SYSTEM PROMPT
+// ============================================================
 
-  additionalProperties: false,
+function buildSystemPrompt() {
 
-  properties: {
-    date: {
-      type: "string"
-    },
-
-    language: {
-      type: "string",
-      enum: ["te"]
-    },
-
-    publisher: {
-      type: "string",
-      enum: ["Vidhwaan"]
-    },
-
-    quote: {
-      type: "object",
-
-      additionalProperties: false,
-
-      properties: {
-        heading: {
-          type: "string",
-          enum: ["నేటి సూక్తి"]
-        },
-
-        title: {
-          type: "string"
-        },
-
-        content: {
-          type: "string"
-        },
-
-        attribution: {
-          type: "string"
-        }
-      },
-
-      required: [
-        "heading",
-        "title",
-        "content",
-        "attribution"
-      ]
-    },
-
-    health: {
-      type: "object",
-
-      additionalProperties: false,
-
-      properties: {
-        heading: {
-          type: "string",
-          enum: ["నేటి ఆరోగ్యం"]
-        },
-
-        title: {
-          type: "string"
-        },
-
-        content: {
-          type: "string"
-        }
-      },
-
-      required: [
-        "heading",
-        "title",
-        "content"
-      ]
-    },
-
-    science: {
-      type: "object",
-
-      additionalProperties: false,
-
-      properties: {
-        heading: {
-          type: "string",
-          enum: ["నేటి విజ్ఞానం"]
-        },
-
-        title: {
-          type: "string"
-        },
-
-        content: {
-          type: "string"
-        }
-      },
-
-      required: [
-        "heading",
-        "title",
-        "content"
-      ]
-    },
-
-    knowledge: {
-      type: "object",
-
-      additionalProperties: false,
-
-      properties: {
-        heading: {
-          type: "string",
-          enum: ["నేటి జ్ఞానం"]
-        },
-
-        title: {
-          type: "string"
-        },
-
-        content: {
-          type: "string"
-        }
-      },
-
-      required: [
-        "heading",
-        "title",
-        "content"
-      ]
-    },
-
-    question: {
-      type: "object",
-
-      additionalProperties: false,
-
-      properties: {
-        heading: {
-          type: "string",
-          enum: ["నేటి ప్రశ్న"]
-        },
-
-        question: {
-          type: "string"
-        },
-
-        answer: {
-          type: "string"
-        }
-      },
-
-      required: [
-        "heading",
-        "question",
-        "answer"
-      ]
-    }
-  },
-
-  required: [
-    "date",
-    "language",
-    "publisher",
-    "quote",
-    "health",
-    "science",
-    "knowledge",
-    "question"
-  ]
-};
-
-/* =========================================================
-   SYSTEM PROMPT
-   ========================================================= */
-
-const SYSTEM_PROMPT = `
-You are the production editorial engine for Vidhwaan Daily Social.
+  return `
+You are the official daily content generator for Vidhwaan.
 
 Vidhwaan is a village-based global technology company.
 
-Your output will be published publicly and may be read and shared by
-a very large audience.
+Generate exactly five publication-ready daily social cards for Telugu-speaking users.
 
-Therefore:
+The final response MUST follow the supplied JSON Schema exactly.
 
-FACTUAL ACCURACY IS MORE IMPORTANT THAN NOVELTY.
+IMPORTANT:
 
-Never invent a fact simply because it sounds interesting.
+There are EXACTLY FIVE cards.
 
-If you are uncertain about a factual claim, DO NOT USE IT.
+Do NOT create:
+- culture
+- సంస్కృతి
+- a separate Bhagavad Gita card
+- any additional card
+- any additional top-level JSON field
 
-Choose a simpler, well-established fact instead.
-
-Do not guess dates, names, numbers, quotations, historical events,
-scientific measurements, medical claims, or attributions.
-
-==================================================
-EXACT OUTPUT
-==================================================
-
-Generate EXACTLY FIVE cards:
+The five cards are exactly:
 
 1. నేటి సూక్తి
 2. నేటి ఆరోగ్యం
@@ -664,152 +300,154 @@ Generate EXACTLY FIVE cards:
 4. నేటి జ్ఞానం
 5. నేటి ప్రశ్న
 
-There is NO sixth card.
+LANGUAGE:
 
-There is NO culture card.
+All user-facing content must be natural, clear Telugu.
 
-There is NO separate Bhagavad Gita card.
+The JSON field "language" must be exactly:
 
-Do not add any other field or section.
+te
 
-==================================================
-LANGUAGE
-==================================================
+The JSON field "publisher" must be exactly:
 
-All user-facing content must be natural Telugu.
+Vidhwaan
 
-Do not write English sentences.
+English is permitted only when genuinely necessary for:
+- unavoidable proper names
+- scientific notation
+- mathematical notation
+- standard units
+- abbreviations
+- Vidhwaan
 
-Do not include:
-- URLs
-- hashtags
-- emojis
-- markdown
-- bullet lists
-- AI references
-- Groq references
-- prompts
-- schema explanations
-- internal reasoning
-- source notes
+Do not write English sentences for the user.
 
-Numbers, mathematical notation and internationally recognized scientific
-symbols may be used when necessary.
+Never mention:
+- AI
+- Groq
+- model
+- prompt
+- schema
+- JSON generation
+- internal instructions
+- system instructions
 
-==================================================
-MOST IMPORTANT INTERNAL REVIEW
-==================================================
+GENERAL CONTENT RULES:
 
-Before returning the JSON, internally review all five cards.
+- Publication-ready.
+- Concise.
+- Useful.
+- Accurate.
+- Clear.
+- Natural Telugu.
+- Suitable for a vertical social card.
+- No markdown.
+- No bullet points.
+- No hashtags.
+- No URLs.
+- No emojis.
+- No fake quotations.
+- No invented facts.
+- No unsupported claims.
+- No sensational claims.
+- No political persuasion.
+- No current political claims.
+- No medical diagnosis.
+- No medical treatment instructions.
 
-For every factual statement ask:
+============================================================
+1. నేటి సూక్తి
+============================================================
 
-1. Is this established knowledge?
-2. Am I certain the fact is correct?
-3. Did I invent a date, number, name or attribution?
-4. Did I overstate the claim?
-5. Could the wording mislead a normal reader?
-6. Is there a simpler and safer way to state it?
-
-If uncertain, replace the topic with a safer established fact.
-
-==================================================
-CARD 1 — నేటి సూక్తి
-==================================================
-
-Create one concise, meaningful and practical thought.
+Create one meaningful and memorable thought.
 
 Prefer an original Vidhwaan thought.
 
-For an original thought:
+If it is an original Vidhwaan thought:
 
-attribution MUST be exactly:
+attribution MUST be:
+
 Vidhwaan
 
-Do not manufacture quotations.
+Never invent a quotation by:
+- a scientist
+- philosopher
+- writer
+- leader
+- historical person
+- deity
+- sage
+- scripture
 
-Do not attribute an invented statement to:
-- Sri Krishna
-- Buddha
-- Vivekananda
-- Gandhi
-- scientists
-- writers
-- philosophers
-- historical figures
-- scriptures
-- public figures
+Never present a paraphrase as an exact quotation.
 
-Do not take a famous quotation, paraphrase it and present it as an
-original quotation.
+============================================================
+2. నేటి ఆరోగ్యం
+============================================================
 
-==================================================
-CARD 2 — నేటి ఆరోగ్యం
-==================================================
+Provide general health education.
 
-Provide general educational health information.
-
-Good topics include:
+Suitable topics include:
 - sleep
 - hydration
 - physical activity
 - nutrition
-- hygiene
 - posture
+- hygiene
 - sunlight
 - stress management
 - healthy routines
 - basic human biology
+- preventive habits
 
 Do NOT:
-- diagnose
-- prescribe
-- tell people to stop medication
-- recommend dangerous treatment
+- diagnose diseases
+- prescribe medicines
+- tell people to stop medicines
 - promise cures
-- claim one food cures disease
-- make unsupported medical claims
-- make universal rules that do not apply to everyone
+- recommend dangerous treatments
+- give emergency medical instructions
+- make unsupported universal numerical rules
 
-Be especially careful with numerical health claims.
+Avoid claims such as:
 
-Do NOT say that every person must drink exactly a fixed amount of water.
+"Everyone must drink exactly 8 glasses."
 
-Use conservative language.
+Use context-sensitive language instead.
 
-==================================================
-CARD 3 — నేటి విజ్ఞానం
-==================================================
+============================================================
+3. నేటి విజ్ఞానం
+============================================================
 
-Use one well-established scientific fact.
+Provide established, evidence-aligned science.
 
-Possible subjects:
+Possible areas:
+- astronomy
+- space
 - physics
 - chemistry
 - biology
-- astronomy
-- space
 - Earth science
-- plants
 - animals
-- human biology
+- plants
+- human-body science
 - technology
+- nature
 - everyday science
 
-Scientific numbers must be accurate.
+Numerical scientific facts must be accurate.
 
-Do not present hypotheses, speculation or uncertain claims as facts.
+Do not present speculation as established fact.
 
-Do not use exaggerated superlatives unless the statement is genuinely
-and precisely justified.
+Avoid exaggerated superlatives unless they are scientifically precise.
 
-==================================================
-CARD 4 — నేటి జ్ఞానం
-==================================================
+============================================================
+4. నేటి జ్ఞానం
+============================================================
 
-Provide one useful, established general-knowledge fact.
+Provide useful general knowledge.
 
-Possible subjects:
+Possible areas:
 - history
 - geography
 - mathematics
@@ -819,49 +457,53 @@ Possible subjects:
 - nature
 - animals
 - technology
+- society
 - economics
-- everyday knowledge
 - important concepts
 
-Historical claims require special caution.
+Historical claims require particular caution.
 
 Never invent:
-- dates
 - names
-- historical decisions
+- dates
+- events
 - motives
+- decisions
 - quotations
-- inventors
-- titles
 
-If you are uncertain, select another fact.
+If uncertain about a historical fact, choose another topic.
 
-==================================================
-CARD 5 — నేటి ప్రశ్న
-==================================================
+============================================================
+5. నేటి ప్రశ్న
+============================================================
 
-Create one enjoyable question with exactly one definite answer.
+Create one enjoyable thinking question.
+
+It MUST have one definite answer.
+
+The question must contain enough information to solve it.
 
 Prefer:
 - logic
-- mathematics
+- simple mathematics
 - probability
-- reasoning
 - observation
+- reasoning
 - everyday situations
 
 Avoid:
 - opinions
-- politics
-- ambiguous puzzles
+- political questions
+- ambiguous questions
 - obscure trivia
-- questions requiring external research
+- questions requiring unverifiable outside knowledge
 
-The question itself must contain enough information to solve it.
+The answer MUST be correct.
 
-The answer must actually be correct.
+The answer may be a pure numerical or mathematical answer.
 
-Pure mathematical answers are allowed, for example:
+Examples:
+
 42
 3/28
 3.14
@@ -869,48 +511,95 @@ Pure mathematical answers are allowed, for example:
 25°C
 2 గంటలు
 
-Do not return an English sentence as the answer.
+Do not write:
 
-==================================================
+"The answer is 42."
+
+Prefer:
+
+42
+
+or:
+
+సమాధానం 42.
+
+============================================================
 ANTI-REPETITION
-==================================================
+============================================================
 
-The recent content supplied below represents content that has already
-been published.
+Recent content is supplied separately.
 
-Do not repeat:
-- the same topic
-- the same fact
-- the same quote idea
-- the same question
-- the same example
-- substantially identical wording
+Do not copy it.
 
-Choose genuinely different content.
+Avoid repeating:
+- exact topics
+- exact titles
+- exact wording
+- quotations
+- facts
+- examples
+- question structures
+- question answers
+- distinctive phrases
 
-==================================================
-FINAL QUALITY STANDARD
-==================================================
+Choose meaningfully different content.
 
-This is public Vidhwaan content.
+============================================================
+FINAL SELF-CHECK
+============================================================
 
-Accuracy is more important than being clever.
+Before returning JSON, silently check:
 
-Useful and established is better than obscure and uncertain.
-
-Simple and correct is better than impressive and questionable.
-
-If a topic cannot be stated confidently and accurately,
-choose another topic.
+1. Exactly five cards exist.
+2. No culture field exists.
+3. No extra fields exist.
+4. All five headings are correct.
+5. Telugu is natural.
+6. The quote attribution is valid.
+7. Health content is safe.
+8. Science content is factual.
+9. Knowledge content is factual.
+10. Question has one definite answer.
+11. Question answer is correct.
+12. No markdown.
+13. No URLs.
+14. No hashtags.
+15. No emojis.
+16. No internal technical language.
+17. No repeated recent content.
+18. Output is complete.
 
 Return ONLY the JSON object.
 `;
+}
 
-/* =========================================================
-   USER PROMPT
-   ========================================================= */
 
-function buildUserPrompt() {
+// ============================================================
+// USER PROMPT
+// ============================================================
+
+function buildUserPrompt(
+  recentContent,
+  previousError
+) {
+
+  let retryInstruction = '';
+
+  if (previousError) {
+
+    retryInstruction = `
+IMPORTANT:
+The previous generation attempt failed validation.
+
+Do NOT repeat the previous mistake.
+
+Previous validation issue:
+${previousError}
+
+Generate a completely fresh valid set of five cards.
+`;
+  }
+
   return `
 Generate today's Vidhwaan Daily Social content.
 
@@ -931,1721 +620,2649 @@ Generate exactly these five cards:
 నేటి జ్ఞానం
 నేటి ప్రశ్న
 
-The five cards must be different from one another in subject and purpose.
+${retryInstruction}
 
-Do not let one card repeat the subject of another card.
+RECENT CONTENT TO AVOID REPEATING:
 
-The date MUST be exactly:
-${TARGET_DATE}
+${recentContent || 'No previous daily content is available.'}
 
-Before returning the JSON, perform an internal editorial review of
-all five cards for accuracy, safety, Telugu quality, usefulness,
-originality and non-repetition.
+Keep each card concise and suitable for a vertical social image.
 
-RECENT PUBLISHED CONTENT:
-
-${buildRecentContent()}
-
-Return only the required JSON object.
+Return only the JSON required by the supplied schema.
 `;
 }
 
-/* =========================================================
-   GROQ REQUEST
-   ========================================================= */
 
-async function requestGroq() {
+// ============================================================
+// JSON SCHEMA
+// ============================================================
+
+function getSchema() {
+
+  return {
+
+    type: 'object',
+
+    properties: {
+
+      date: {
+        type: 'string'
+      },
+
+      language: {
+        type: 'string',
+        enum: ['te']
+      },
+
+      publisher: {
+        type: 'string',
+        enum: ['Vidhwaan']
+      },
+
+
+      quote: {
+
+        type: 'object',
+
+        properties: {
+
+          heading: {
+            type: 'string',
+            enum: ['నేటి సూక్తి']
+          },
+
+          title: {
+            type: 'string'
+          },
+
+          content: {
+            type: 'string'
+          },
+
+          attribution: {
+            type: 'string'
+          }
+        },
+
+        required: [
+          'heading',
+          'title',
+          'content',
+          'attribution'
+        ],
+
+        additionalProperties: false
+      },
+
+
+      health: {
+
+        type: 'object',
+
+        properties: {
+
+          heading: {
+            type: 'string',
+            enum: ['నేటి ఆరోగ్యం']
+          },
+
+          title: {
+            type: 'string'
+          },
+
+          content: {
+            type: 'string'
+          }
+        },
+
+        required: [
+          'heading',
+          'title',
+          'content'
+        ],
+
+        additionalProperties: false
+      },
+
+
+      science: {
+
+        type: 'object',
+
+        properties: {
+
+          heading: {
+            type: 'string',
+            enum: ['నేటి విజ్ఞానం']
+          },
+
+          title: {
+            type: 'string'
+          },
+
+          content: {
+            type: 'string'
+          }
+        },
+
+        required: [
+          'heading',
+          'title',
+          'content'
+        ],
+
+        additionalProperties: false
+      },
+
+
+      knowledge: {
+
+        type: 'object',
+
+        properties: {
+
+          heading: {
+            type: 'string',
+            enum: ['నేటి జ్ఞానం']
+          },
+
+          title: {
+            type: 'string'
+          },
+
+          content: {
+            type: 'string'
+          }
+        },
+
+        required: [
+          'heading',
+          'title',
+          'content'
+        ],
+
+        additionalProperties: false
+      },
+
+
+      question: {
+
+        type: 'object',
+
+        properties: {
+
+          heading: {
+            type: 'string',
+            enum: ['నేటి ప్రశ్న']
+          },
+
+          question: {
+            type: 'string'
+          },
+
+          answer: {
+            type: 'string'
+          }
+        },
+
+        required: [
+          'heading',
+          'question',
+          'answer'
+        ],
+
+        additionalProperties: false
+      }
+    },
+
+    required: [
+      'date',
+      'language',
+      'publisher',
+      'quote',
+      'health',
+      'science',
+      'knowledge',
+      'question'
+    ],
+
+    additionalProperties: false
+  };
+}
+
+
+// ============================================================
+// GENERATION + VALIDATION + RETRY
+// ============================================================
+
+async function generateValidatedContent(
+  recentContent
+) {
+
+  let lastError = null;
+
+  let completionTokens =
+    INITIAL_MAX_COMPLETION_TOKENS;
+
+  let attempt = 1;
+
+
+  while (
+    attempt <= MAX_ATTEMPTS
+  ) {
+
+    console.log('');
+    console.log('========================================');
+    console.log(
+      `GENERATION ATTEMPT ${attempt}/${MAX_ATTEMPTS}`
+    );
+    console.log(
+      `Date: ${TARGET_DATE}`
+    );
+    console.log(
+      `Model: ${MODEL}`
+    );
+    console.log(
+      `Reasoning: high`
+    );
+    console.log(
+      `Completion budget: ${completionTokens}`
+    );
+    console.log('========================================');
+
+
+    const systemPrompt =
+      buildSystemPrompt();
+
+    const userPrompt =
+      buildUserPrompt(
+        recentContent,
+        lastError
+      );
+
+
+    try {
+
+      const response =
+        await requestGroqWithRateLimitHandling(
+          systemPrompt,
+          userPrompt,
+          completionTokens
+        );
+
+
+      const rawContent =
+        extractGroqContent(
+          response
+        );
+
+
+      if (!rawContent) {
+
+        throw new Error(
+          'Groq returned an empty response.'
+        );
+      }
+
+
+      let parsed;
+
+      try {
+
+        parsed =
+          JSON.parse(
+            rawContent
+          );
+
+      } catch (error) {
+
+        throw new Error(
+          `Groq returned invalid JSON: ${error.message}`
+        );
+      }
+
+
+      /*
+       * Metadata is deterministic.
+       */
+      parsed.date =
+        TARGET_DATE;
+
+      parsed.language =
+        'te';
+
+      parsed.publisher =
+        'Vidhwaan';
+
+
+      console.log('');
+      console.log(
+        'Validating generated content...'
+      );
+
+
+      validateContent(
+        parsed
+      );
+
+
+      console.log('');
+      console.log(
+        'Generated content passed validation.'
+      );
+
+
+      return parsed;
+
+
+    } catch (error) {
+
+      lastError =
+        error?.message ||
+        String(error);
+
+
+      console.error('');
+      console.error(
+        `Attempt ${attempt} rejected: ${lastError}`
+      );
+
+
+      /*
+       * If Groq tells us that the completion itself
+       * was truncated, increase the output budget.
+       */
+      if (
+        isCompletionLimitError(
+          error
+        )
+      ) {
+
+        if (
+          completionTokens <
+          LARGE_MAX_COMPLETION_TOKENS
+        ) {
+
+          completionTokens =
+            LARGE_MAX_COMPLETION_TOKENS;
+
+          console.log('');
+          console.log(
+            'The previous response reached the completion limit.'
+          );
+          console.log(
+            `Increasing completion budget to ${completionTokens}.`
+          );
+
+        }
+      }
+
+
+      if (
+        attempt >= MAX_ATTEMPTS
+      ) {
+
+        break;
+      }
+
+
+      console.log('');
+      console.log(
+        `Waiting ${VALIDATION_RETRY_DELAY_MS / 1000} seconds before a fresh generation...`
+      );
+
+      await sleep(
+        VALIDATION_RETRY_DELAY_MS
+      );
+
+      attempt++;
+    }
+  }
+
+
+  throw new Error(
+    `All ${MAX_ATTEMPTS} content-generation attempts failed. ` +
+    `No daily JSON was created. ` +
+    `Last error: ${lastError || 'Unknown error.'}`
+  );
+}
+
+
+// ============================================================
+// GROQ REQUEST WITH RATE-LIMIT WAITING
+// ============================================================
+
+async function requestGroqWithRateLimitHandling(
+  systemPrompt,
+  userPrompt,
+  completionTokens
+) {
+
+  let totalWaited =
+    0;
+
+
+  while (true) {
+
+    try {
+
+      return await requestGroq(
+        systemPrompt,
+        userPrompt,
+        completionTokens
+      );
+
+
+    } catch (error) {
+
+      /*
+       * 429 is NOT a content-generation failure.
+       *
+       * Wait for Groq's token window and then send
+       * the same generation request again.
+       *
+       * This does NOT consume one of the five
+       * content-generation attempts.
+       */
+      if (
+        Number(error?.status) === 429
+      ) {
+
+        const waitMs =
+          getRateLimitWaitMs(
+            error
+          );
+
+
+        if (
+          totalWaited + waitMs >
+          MAX_RATE_WAIT_MS
+        ) {
+
+          throw new Error(
+            `Groq rate limit wait exceeded ${MAX_RATE_WAIT_MS / 60000} minutes. ` +
+            `Last rate-limit message: ${error.message}`
+          );
+        }
+
+
+        console.log('');
+        console.log(
+          '========================================'
+        );
+        console.log(
+          'GROQ TOKEN LIMIT REACHED'
+        );
+        console.log(
+          '========================================'
+        );
+
+        console.log(
+          `Waiting ${formatDuration(waitMs)} for the token window to reset...`
+        );
+
+        console.log(
+          'This wait does NOT consume a generation attempt.'
+        );
+
+        console.log(
+          '========================================'
+        );
+
+
+        await sleep(
+          waitMs
+        );
+
+
+        totalWaited +=
+          waitMs;
+
+
+        console.log('');
+        console.log(
+          'Groq wait completed.'
+        );
+
+        console.log(
+          'Requesting generation again...'
+        );
+
+
+        continue;
+      }
+
+
+      throw error;
+    }
+  }
+}
+
+
+// ============================================================
+// SINGLE GROQ HTTP REQUEST
+// ============================================================
+
+async function requestGroq(
+  systemPrompt,
+  userPrompt,
+  completionTokens
+) {
+
   const controller =
     new AbortController();
 
   const timeout =
     setTimeout(
-      () => controller.abort(),
+      () => {
+        controller.abort();
+      },
       REQUEST_TIMEOUT_MS
     );
 
+
   try {
+
     const response =
       await fetch(
-        GROQ_API_URL,
+        API_URL,
         {
-          method: "POST",
+          method: 'POST',
 
           headers: {
-            Authorization:
-              `Bearer ${GROQ_API_KEY}`,
 
-            "Content-Type":
-              "application/json"
+            'Authorization':
+              `Bearer ${API_KEY}`,
+
+            'Content-Type':
+              'application/json'
           },
 
-          body: JSON.stringify({
-            model: GROQ_MODEL,
+          body:
+            JSON.stringify({
 
-            temperature:
-              TEMPERATURE,
+              model:
+                MODEL,
 
-            reasoning_effort:
-              REASONING_EFFORT,
+              messages: [
 
-            messages: [
-              {
-                role: "system",
-                content:
-                  SYSTEM_PROMPT
+                {
+                  role: 'system',
+
+                  content:
+                    systemPrompt
+                },
+
+                {
+                  role: 'user',
+
+                  content:
+                    userPrompt
+                }
+
+              ],
+
+
+              /*
+               * Strict structured output.
+               */
+              response_format: {
+
+                type:
+                  'json_schema',
+
+                json_schema: {
+
+                  name:
+                    'vidhwaan_daily_social',
+
+                  strict:
+                    true,
+
+                  schema:
+                    getSchema()
+                }
               },
-              {
-                role: "user",
-                content:
-                  buildUserPrompt()
-              }
-            ],
 
-            response_format: {
-              type: "json_schema",
 
-              json_schema: {
-                name:
-                  "vidhwaan_daily_social",
+              /*
+               * GPT-OSS reasoning.
+               */
+              reasoning_effort:
+                'high',
 
-                strict: true,
+              reasoning_format:
+                'hidden',
 
-                schema:
-                  RESPONSE_SCHEMA
-              }
-            }
-          }),
+
+              /*
+               * Low temperature for factual
+               * and schema-focused generation.
+               */
+              temperature:
+                0.15,
+
+
+              /*
+               * Current Groq API parameter.
+               */
+              max_completion_tokens:
+                completionTokens
+            }),
 
           signal:
             controller.signal
         }
       );
 
+
     const responseText =
       await response.text();
 
-    if (!response.ok) {
-      throw new Error(
-        `Groq API error ${response.status}: ${responseText.slice(
-          0,
-          2000
-        )}`
-      );
-    }
 
-    let payload;
+    let data;
 
     try {
-      payload =
+
+      data =
         JSON.parse(
           responseText
         );
+
     } catch {
-      throw new Error(
-        "Groq API returned invalid JSON."
-      );
-    }
 
-    const message =
-      payload?.choices?.[0]?.message;
-
-    if (!message) {
-      throw new Error(
-        "Groq response does not contain a message."
-      );
-    }
-
-    if (
-      message.refusal
-    ) {
-      throw new Error(
-        `Groq refused the request: ${message.refusal}`
-      );
-    }
-
-    if (
-      typeof message.content !==
-      "string"
-    ) {
-      throw new Error(
-        "Groq response content is not a string."
-      );
-    }
-
-    let parsed;
-
-    try {
-      parsed =
-        JSON.parse(
-          message.content
+      const error =
+        new Error(
+          `Groq returned a non-JSON HTTP response. ` +
+          `HTTP ${response.status}: ` +
+          responseText.slice(0, 500)
         );
-    } catch {
-      throw new Error(
-        "Groq returned content that is not valid JSON."
-      );
+
+      error.status =
+        response.status;
+
+      throw error;
     }
 
-    return parsed;
+
+    if (!response.ok) {
+
+      const message =
+        data?.error?.message ||
+        data?.message ||
+        `HTTP ${response.status}`;
+
+
+      const error =
+        new Error(
+          `Groq API error ${response.status}: ${message}`
+        );
+
+
+      error.status =
+        response.status;
+
+
+      /*
+       * Preserve rate-limit headers.
+       */
+      error.retryAfter =
+        response.headers.get(
+          'retry-after'
+        );
+
+      error.resetTokens =
+        response.headers.get(
+          'x-ratelimit-reset-tokens'
+        );
+
+      error.remainingTokens =
+        response.headers.get(
+          'x-ratelimit-remaining-tokens'
+        );
+
+      error.limitTokens =
+        response.headers.get(
+          'x-ratelimit-limit-tokens'
+        );
+
+
+      throw error;
+    }
+
+
+    /*
+     * Log useful token information without
+     * exposing the API key.
+     */
+    logRateHeaders(
+      response
+    );
+
+
+    return data;
+
+
+  } catch (error) {
+
+    if (
+      error?.name ===
+      'AbortError'
+    ) {
+
+      const timeoutError =
+        new Error(
+          `Groq request timed out after ${REQUEST_TIMEOUT_MS / 1000} seconds.`
+        );
+
+      timeoutError.retryable =
+        true;
+
+      throw timeoutError;
+    }
+
+
+    throw error;
+
 
   } finally {
-    clearTimeout(timeout);
-  }
-}
 
-/* =========================================================
-   STRUCTURE VALIDATION
-   ========================================================= */
-
-function validateStructure(data) {
-  if (
-    !isObject(data)
-  ) {
-    fail(
-      "Generated result is not an object."
-    );
-  }
-
-  const expectedKeys = [
-    "date",
-    "language",
-    "publisher",
-    "quote",
-    "health",
-    "science",
-    "knowledge",
-    "question"
-  ];
-
-  const actualKeys =
-    Object.keys(data);
-
-  if (
-    JSON.stringify(actualKeys) !==
-    JSON.stringify(expectedKeys)
-  ) {
-    fail(
-      `Invalid top-level structure. Received: ${actualKeys.join(
-        ", "
-      )}`
-    );
-  }
-
-  if (
-    data.date !==
-    TARGET_DATE
-  ) {
-    fail(
-      `Wrong date. Expected ${TARGET_DATE}, received ${data.date}.`
-    );
-  }
-
-  if (
-    data.language !== "te"
-  ) {
-    fail(
-      `language must be "te".`
-    );
-  }
-
-  if (
-    data.publisher !==
-    "Vidhwaan"
-  ) {
-    fail(
-      `publisher must be "Vidhwaan".`
-    );
-  }
-
-  const sections = [
-    "quote",
-    "health",
-    "science",
-    "knowledge",
-    "question"
-  ];
-
-  for (
-    const section of sections
-  ) {
-    if (
-      !isObject(
-        data[section]
-      )
-    ) {
-      fail(
-        `${section} is missing or invalid.`
-      );
-    }
-  }
-
-  if (
-    "culture" in data
-  ) {
-    fail(
-      "Forbidden culture section exists."
+    clearTimeout(
+      timeout
     );
   }
 }
 
-/* =========================================================
-   CARD FIELD VALIDATION
-   ========================================================= */
 
-function validateCardFields(
-  card,
-  section,
-  expectedFields
+// ============================================================
+// GROQ CONTENT EXTRACTION
+// ============================================================
+
+function extractGroqContent(
+  response
 ) {
-  const actualFields =
-    Object.keys(card);
+
+  const message =
+    response
+      ?.choices
+      ?.at(0)
+      ?.message;
+
+
+  const content =
+    message?.content;
+
 
   if (
-    JSON.stringify(actualFields) !==
-    JSON.stringify(expectedFields)
+    typeof content ===
+    'string'
   ) {
-    fail(
-      `${section} has invalid fields.`
+
+    return content.trim();
+  }
+
+
+  if (
+    message?.refusal
+  ) {
+
+    throw new Error(
+      `Groq refused the generation: ${message.refusal}`
     );
   }
 
-  for (
-    const field of expectedFields
+
+  return '';
+}
+
+
+// ============================================================
+// RATE LIMIT HEADER LOGGING
+// ============================================================
+
+function logRateHeaders(
+  response
+) {
+
+  const remaining =
+    response.headers.get(
+      'x-ratelimit-remaining-tokens'
+    );
+
+  const limit =
+    response.headers.get(
+      'x-ratelimit-limit-tokens'
+    );
+
+  const reset =
+    response.headers.get(
+      'x-ratelimit-reset-tokens'
+    );
+
+
+  if (
+    remaining ||
+    limit ||
+    reset
   ) {
+
+    console.log('');
+
+    console.log(
+      'Groq token window information:'
+    );
+
+    if (remaining) {
+
+      console.log(
+        `Remaining tokens: ${remaining}`
+      );
+    }
+
+    if (limit) {
+
+      console.log(
+        `Token limit: ${limit}`
+      );
+    }
+
+    if (reset) {
+
+      console.log(
+        `Token reset: ${reset}`
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// RATE LIMIT WAIT CALCULATION
+// ============================================================
+
+function getRateLimitWaitMs(
+  error
+) {
+
+  /*
+   * First preference:
+   * retry-after header.
+   */
+  const retryAfter =
+    error?.retryAfter;
+
+
+  if (
+    retryAfter
+  ) {
+
+    const parsed =
+      parseRetryAfter(
+        retryAfter
+      );
+
     if (
-      !isNonEmptyString(
-        card[field]
+      Number.isFinite(
+        parsed
       )
     ) {
-      fail(
-        `${section}.${field} must be a non-empty string.`
-      );
-    }
-  }
-}
 
-/* =========================================================
-   HEADINGS
-   ========================================================= */
-
-function validateHeadings(data) {
-  const headings = {
-    quote:
-      "నేటి సూక్తి",
-
-    health:
-      "నేటి ఆరోగ్యం",
-
-    science:
-      "నేటి విజ్ఞానం",
-
-    knowledge:
-      "నేటి జ్ఞానం",
-
-    question:
-      "నేటి ప్రశ్న"
-  };
-
-  for (
-    const [section, heading]
-    of Object.entries(headings)
-  ) {
-    if (
-      data[section].heading !==
-      heading
-    ) {
-      fail(
-        `${section}.heading is incorrect.`
-      );
-    }
-  }
-}
-
-/* =========================================================
-   LANGUAGE VALIDATION
-   ========================================================= */
-
-function validateLanguage(data) {
-  const fields = [
-    [
-      "quote.title",
-      data.quote.title
-    ],
-    [
-      "quote.content",
-      data.quote.content
-    ],
-    [
-      "health.title",
-      data.health.title
-    ],
-    [
-      "health.content",
-      data.health.content
-    ],
-    [
-      "science.title",
-      data.science.title
-    ],
-    [
-      "science.content",
-      data.science.content
-    ],
-    [
-      "knowledge.title",
-      data.knowledge.title
-    ],
-    [
-      "knowledge.content",
-      data.knowledge.content
-    ],
-    [
-      "question.question",
-      data.question.question
-    ]
-  ];
-
-  for (
-    const [name, value]
-    of fields
-  ) {
-    if (
-      !hasTelugu(value)
-    ) {
-      fail(
-        `${name} does not contain Telugu text.`
+      /*
+       * Add a small safety margin.
+       */
+      return Math.max(
+        3000,
+        parsed + 2000
       );
     }
   }
 
-  const answer =
-    data.question.answer;
+
+  /*
+   * Second preference:
+   * x-ratelimit-reset-tokens.
+   *
+   * Groq may return values such as:
+   *
+   * 1m30.5s
+   * 30s
+   * 1500ms
+   */
+  const reset =
+    error?.resetTokens;
+
 
   if (
-    !hasTelugu(answer) &&
-    !isPureMathematicalAnswer(
-      answer
-    )
+    reset
   ) {
-    fail(
-      "question.answer must be Telugu or a valid mathematical/numeric answer."
-    );
+
+    const parsed =
+      parseDurationString(
+        reset
+      );
+
+    if (
+      Number.isFinite(
+        parsed
+      )
+    ) {
+
+      return Math.max(
+        3000,
+        parsed + 2000
+      );
+    }
   }
+
+
+  /*
+   * Conservative fallback.
+   */
+  return 65000;
 }
 
-/* =========================================================
-   PURE MATHEMATICAL ANSWER
-   ========================================================= */
 
-function isPureMathematicalAnswer(
+// ============================================================
+// RETRY-AFTER PARSER
+// ============================================================
+
+function parseRetryAfter(
   value
 ) {
-  const text =
-    normalizeWhitespace(
-      value
+
+  const numeric =
+    Number(
+      String(value).trim()
     );
+
+
+  if (
+    Number.isFinite(
+      numeric
+    )
+  ) {
+
+    /*
+     * HTTP Retry-After is normally seconds.
+     */
+    return Math.ceil(
+      numeric * 1000
+    );
+  }
+
+
+  return NaN;
+}
+
+
+// ============================================================
+// GROQ RESET-DURATION PARSER
+// ============================================================
+
+function parseDurationString(
+  value
+) {
+
+  const text =
+    String(value)
+      .trim()
+      .toLowerCase();
+
 
   if (!text) {
-    return false;
+    return NaN;
   }
 
-  if (
-    /^\d+(?:\.\d+)?$/.test(text)
-  ) {
-    return true;
-  }
-
-  if (
-    /^\d+\s*\/\s*\d+$/.test(text)
-  ) {
-    return true;
-  }
-
-  if (
-    /^\d+(?:\.\d+)?\s*%$/.test(text)
-  ) {
-    return true;
-  }
-
-  if (
-    /^\d+(?:\.\d+)?\s*°[CF]$/.test(
-      text
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    /^[0-9+\-*/().=%°\s]+$/.test(
-      text
-    ) &&
-    /\d/.test(text)
-  ) {
-    return true;
-  }
-
-  if (
-    /^\d+(?:\.\d+)?\s+[\u0C00-\u0C7F]+$/u.test(
-      text
-    )
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-/* =========================================================
-   QUOTE VALIDATION
-   ========================================================= */
-
-function validateQuote(data) {
-  const quote =
-    data.quote;
-
-  if (
-    quote.attribution !==
-    "Vidhwaan"
-  ) {
-    fail(
-      "Quote attribution must be exactly Vidhwaan."
-    );
-  }
-
-  if (
-    quote.content.length <
-      20 ||
-    quote.content.length >
-      300
-  ) {
-    fail(
-      "Quote content length is unsuitable."
-    );
-  }
-
-  const fabricatedAttributionPatterns = [
-    "శ్రీకృష్ణ",
-    "శ్రీ కృష్ణ",
-    "కృష్ణుడు",
-    "బుద్ధుడు",
-    "వివేకానంద",
-    "గాంధీ",
-    "గాంధీజీ",
-    "అబ్దుల్ కలాం",
-    "ఐన్‌స్టీన్",
-    "ఐన్స్టీన్",
-    "స్వామి వివేకానంద",
-    "భగవద్గీత",
-    "వేదం",
-    "ఉపనిషత్"
-  ];
-
-  if (
-    containsAny(
-      quote.content,
-      fabricatedAttributionPatterns
-    )
-  ) {
-    fail(
-      "Quote appears to contain a famous/religious attribution."
-    );
-  }
-}
-
-/* =========================================================
-   HEALTH VALIDATION
-   ========================================================= */
-
-function validateHealth(data) {
-  const text =
-    [
-      data.health.title,
-      data.health.content
-    ].join(" ");
-
-  const dangerousPatterns = [
-    "వ్యాధిని నయం",
-    "వ్యాధి నయం",
-    "క్యాన్సర్ నయం",
-    "డయాబెటిస్ నయం",
-    "బీపీ నయం",
-    "మందులు ఆప",
-    "మందులు నిలిప",
-    "మందులు మాన",
-    "డాక్టర్ అవసరం లేదు",
-    "100% నయం",
-    "శాశ్వతంగా నయం",
-    "గ్యారంటీగా నయం",
-    "హామీగా నయం",
-    "ఒక్కసారిగా నయం"
-  ];
-
-  if (
-    containsAny(
-      text,
-      dangerousPatterns
-    )
-  ) {
-    fail(
-      "Unsafe medical claim detected."
-    );
-  }
-
-  const unsupportedUniversalHealthPatterns = [
-    "అందరూ తప్పనిసరిగా 8 గ్లాస్",
-    "ప్రతి ఒక్కరూ 8 గ్లాస్",
-    "రోజుకు తప్పనిసరిగా 8 గ్లాస్",
-    "అందరూ రోజుకు 2 లీటర్లు",
-    "ప్రతి ఒక్కరూ రోజుకు 2 లీటర్లు",
-    "అందరికీ రోజుకు 2 లీటర్లు"
-  ];
-
-  if (
-    containsAny(
-      text,
-      unsupportedUniversalHealthPatterns
-    )
-  ) {
-    fail(
-      "Unsupported universal hydration claim detected."
-    );
-  }
-
-  if (
-    text.length < 40 ||
-    text.length > 500
-  ) {
-    fail(
-      "Health content length is unsuitable."
-    );
-  }
-}
-
-/* =========================================================
-   SCIENCE VALIDATION
-   ========================================================= */
-
-function validateScience(data) {
-  const text =
-    [
-      data.science.title,
-      data.science.content
-    ].join(" ");
-
-  const obviouslyFalsePatterns = [
-    "భూమి చదునుగా ఉంది",
-    "సూర్యుడు భూమి చుట్టూ తిరుగుతాడు",
-    "చంద్రుడు స్వయంగా వెలుగుతాడు",
-    "శబ్దం వాక్యూమ్‌లో ప్రయాణిస్తుంది"
-  ];
-
-  if (
-    containsAny(
-      text,
-      obviouslyFalsePatterns
-    )
-  ) {
-    fail(
-      "Obvious scientific error detected."
-    );
-  }
 
   /*
-   * Prevent careless superlatives.
+   * Pure numeric values are interpreted
+   * conservatively as seconds.
    */
-  const broadSuperlatives = [
-    "విశ్వంలో అత్యంత వేగమైనది",
-    "ప్రపంచంలోనే అత్యంత",
-    "100% ఖచ్చితంగా"
-  ];
-
   if (
-    containsAny(
-      text,
-      broadSuperlatives
+    /^\d+(?:\.\d+)?$/.test(
+      text
     )
   ) {
-    fail(
-      "Potentially misleading scientific superlative detected."
+
+    return Math.ceil(
+      Number(text) * 1000
     );
   }
 
-  if (
-    data.science.content.length <
-      45 ||
-    data.science.content.length >
-      550
+
+  let totalMs = 0;
+
+  let matched = false;
+
+
+  const regex =
+    /(\d+(?:\.\d+)?)\s*(ms|s|m|h)/g;
+
+
+  let match;
+
+
+  while (
+    (match = regex.exec(text)) !== null
   ) {
-    fail(
-      "Science content length is unsuitable."
-    );
-  }
-}
 
-/* =========================================================
-   KNOWLEDGE VALIDATION
-   ========================================================= */
+    matched = true;
 
-function validateKnowledge(data) {
-  const text =
-    [
-      data.knowledge.title,
-      data.knowledge.content
-    ].join(" ");
 
-  /*
-   * Specific known historical error that must never
-   * appear again.
-   */
-  const falseHistoricalPatterns = [
-    "లార్డ్ మౌంట్బేటన్ నిర్ణయించిన",
-    "మౌంట్బేటన్ నిర్ణయించిన తర్వాత",
-    "మౌంట్బేటన్ నిర్ణయంతో 1911"
-  ];
-
-  if (
-    containsAny(
-      text,
-      falseHistoricalPatterns
-    )
-  ) {
-    fail(
-      "Incorrect historical attribution detected."
-    );
-  }
-
-  if (
-    /1911/.test(text) &&
-    /రాజధాని|కలకత్తా|ఢిల్లీ/.test(text) &&
-    /మౌంట్బేటన్|మౌంట్‌బేటన్/.test(text)
-  ) {
-    fail(
-      "1911 Indian capital statement incorrectly mentions Mountbatten."
-    );
-  }
-
-  if (
-    data.knowledge.content.length <
-      45 ||
-    data.knowledge.content.length >
-      600
-  ) {
-    fail(
-      "Knowledge content length is unsuitable."
-    );
-  }
-}
-
-/* =========================================================
-   QUESTION VALIDATION
-   ========================================================= */
-
-function validateQuestion(data) {
-  const question =
-    normalizeWhitespace(
-      data.question.question
-    );
-
-  const answer =
-    normalizeWhitespace(
-      data.question.answer
-    );
-
-  if (
-    question.length < 25
-  ) {
-    fail(
-      "Question is too short."
-    );
-  }
-
-  if (
-    question.length > 500
-  ) {
-    fail(
-      "Question is too long."
-    );
-  }
-
-  if (
-    answer.length > 200
-  ) {
-    fail(
-      "Question answer is too long."
-    );
-  }
-
-  const subjectivePatterns = [
-    "మీ అభిప్రాయం",
-    "మీకు ఏది ఇష్టం",
-    "ఎవరు గొప్ప",
-    "ఏది ఉత్తమం",
-    "ఎవరిని ఎంచుకుంటారు"
-  ];
-
-  if (
-    containsAny(
-      question,
-      subjectivePatterns
-    )
-  ) {
-    fail(
-      "Question is subjective."
-    );
-  }
-
-  if (
-    hasLatinLetters(answer) &&
-    !isPureMathematicalAnswer(
-      answer
-    )
-  ) {
-    fail(
-      "Question answer contains an English sentence."
-    );
-  }
-}
-
-/* =========================================================
-   GENERAL CONTENT QUALITY
-   ========================================================= */
-
-function validateGeneralQuality(data) {
-  const allText =
-    [
-      data.quote.title,
-      data.quote.content,
-      data.quote.attribution,
-
-      data.health.title,
-      data.health.content,
-
-      data.science.title,
-      data.science.content,
-
-      data.knowledge.title,
-      data.knowledge.content,
-
-      data.question.question,
-      data.question.answer
-    ].join(" ");
-
-  const forbiddenPatterns = [
-    "http://",
-    "https://",
-    "www.",
-    "groq",
-    "openai",
-    "chatgpt",
-    "prompt",
-    "schema",
-    "#"
-  ];
-
-  if (
-    containsAny(
-      allText,
-      forbiddenPatterns
-    )
-  ) {
-    fail(
-      "Forbidden internal or technical content detected."
-    );
-  }
-
-  const cards = [
-    [
-      "quote",
-      data.quote.content
-    ],
-    [
-      "health",
-      data.health.content
-    ],
-    [
-      "science",
-      data.science.content
-    ],
-    [
-      "knowledge",
-      data.knowledge.content
-    ],
-    [
-      "question",
-      data.question.question
-    ]
-  ];
-
-  for (
-    const [name, content]
-    of cards
-  ) {
-    if (
-      wordCount(content) >
-      80
-    ) {
-      fail(
-        `${name} is too long for a shareable card.`
+    const amount =
+      Number(
+        match[1]
       );
-    }
-  }
-}
 
-/* =========================================================
-   SAME-DAY CARD REPETITION
-   ========================================================= */
+    const unit =
+      match[2];
 
-function validateInternalCardDifference(
-  data
-) {
-  const cards = [
-    {
-      name: "quote",
-      title:
-        data.quote.title,
-      content:
-        data.quote.content
-    },
 
-    {
-      name: "health",
-      title:
-        data.health.title,
-      content:
-        data.health.content
-    },
-
-    {
-      name: "science",
-      title:
-        data.science.title,
-      content:
-        data.science.content
-    },
-
-    {
-      name: "knowledge",
-      title:
-        data.knowledge.title,
-      content:
-        data.knowledge.content
-    },
-
-    {
-      name: "question",
-      title: "",
-      content:
-        data.question.question
-    }
-  ];
-
-  for (
-    let i = 0;
-    i < cards.length;
-    i++
-  ) {
-    for (
-      let j = i + 1;
-      j < cards.length;
-      j++
+    if (
+      unit === 'ms'
     ) {
-      const a =
-        cards[i];
 
-      const b =
-        cards[j];
+      totalMs +=
+        amount;
 
-      const score =
-        similarityScore(
-          `${a.title} ${a.content}`,
-          `${b.title} ${b.content}`
-        );
-
-      if (
-        score >= 0.75
-      ) {
-        fail(
-          `Today's ${a.name} and ${b.name} are too similar.`
-        );
-      }
-    }
-  }
-}
-
-/* =========================================================
-   RECENT CONTENT REPETITION
-   ========================================================= */
-
-function validateRecentRepetition(
-  data
-) {
-  const currentCards = [
-    {
-      section: "quote",
-      title:
-        data.quote.title,
-      content:
-        data.quote.content
-    },
-
-    {
-      section: "health",
-      title:
-        data.health.title,
-      content:
-        data.health.content
-    },
-
-    {
-      section: "science",
-      title:
-        data.science.title,
-      content:
-        data.science.content
-    },
-
-    {
-      section: "knowledge",
-      title:
-        data.knowledge.title,
-      content:
-        data.knowledge.content
-    },
-
-    {
-      section: "question",
-      title: "",
-      content:
-        data.question.question
-    }
-  ];
-
-  for (
-    const recent of recentContent
-  ) {
-    const oldCards = [
-      {
-        section: "quote",
-        title:
-          recent.quote?.title ||
-          "",
-        content:
-          recent.quote?.content ||
-          ""
-      },
-
-      {
-        section: "health",
-        title:
-          recent.health?.title ||
-          "",
-        content:
-          recent.health?.content ||
-          ""
-      },
-
-      {
-        section: "science",
-        title:
-          recent.science?.title ||
-          "",
-        content:
-          recent.science?.content ||
-          ""
-      },
-
-      {
-        section: "knowledge",
-        title:
-          recent.knowledge?.title ||
-          "",
-        content:
-          recent.knowledge?.content ||
-          ""
-      },
-
-      {
-        section: "question",
-        title: "",
-        content:
-          recent.question?.question ||
-          ""
-      }
-    ];
-
-    for (
-      const current of currentCards
+    } else if (
+      unit === 's'
     ) {
-      for (
-        const old of oldCards
-      ) {
-        if (
-          !old.content
-        ) {
-          continue;
-        }
 
-        const titleSimilarity =
-          current.title &&
-          old.title
-            ? similarityScore(
-                current.title,
-                old.title
-              )
-            : 0;
+      totalMs +=
+        amount * 1000;
 
-        const contentSimilarity =
-          similarityScore(
-            current.content,
-            old.content
-          );
+    } else if (
+      unit === 'm'
+    ) {
 
-        if (
-          titleSimilarity >=
-            0.85 ||
-          contentSimilarity >=
-            0.88
-        ) {
-          fail(
-            `${current.section} is too similar to content from ${recent.date}.`
-          );
-        }
-      }
+      totalMs +=
+        amount * 60 * 1000;
+
+    } else if (
+      unit === 'h'
+    ) {
+
+      totalMs +=
+        amount * 60 * 60 * 1000;
     }
   }
+
+
+  if (!matched) {
+    return NaN;
+  }
+
+
+  return Math.ceil(
+    totalMs
+  );
 }
 
-/* =========================================================
-   NORMALIZE FINAL PUBLIC JSON
-   ========================================================= */
 
-function normalizeOutput(
+// ============================================================
+// COMPLETION-LIMIT DETECTION
+// ============================================================
+
+function isCompletionLimitError(
+  error
+) {
+
+  const message =
+    String(
+      error?.message ||
+      ''
+    ).toLowerCase();
+
+
+  return (
+    message.includes(
+      'max completion tokens'
+    ) ||
+    message.includes(
+      'completion tokens reached'
+    ) ||
+    message.includes(
+      'output was truncated'
+    ) ||
+    message.includes(
+      'missing required content'
+    ) ||
+    message.includes(
+      'missing properties'
+    )
+  );
+}
+
+
+// ============================================================
+// FINAL NORMALIZATION
+// ============================================================
+
+function normalizeFinalContent(
   data
 ) {
+
   return {
+
     date:
       TARGET_DATE,
 
     language:
-      "te",
+      'te',
 
     publisher:
-      "Vidhwaan",
+      'Vidhwaan',
+
 
     quote: {
+
       heading:
-        "నేటి సూక్తి",
+        'నేటి సూక్తి',
 
       title:
-        normalizeWhitespace(
+        cleanText(
           data.quote.title
         ),
 
       content:
-        normalizeWhitespace(
+        cleanText(
           data.quote.content
         ),
 
       attribution:
-        "Vidhwaan"
+        cleanText(
+          data.quote.attribution
+        )
     },
 
+
     health: {
+
       heading:
-        "నేటి ఆరోగ్యం",
+        'నేటి ఆరోగ్యం',
 
       title:
-        normalizeWhitespace(
+        cleanText(
           data.health.title
         ),
 
       content:
-        normalizeWhitespace(
+        cleanText(
           data.health.content
         )
     },
 
+
     science: {
+
       heading:
-        "నేటి విజ్ఞానం",
+        'నేటి విజ్ఞానం',
 
       title:
-        normalizeWhitespace(
+        cleanText(
           data.science.title
         ),
 
       content:
-        normalizeWhitespace(
+        cleanText(
           data.science.content
         )
     },
 
+
     knowledge: {
+
       heading:
-        "నేటి జ్ఞానం",
+        'నేటి జ్ఞానం',
 
       title:
-        normalizeWhitespace(
+        cleanText(
           data.knowledge.title
         ),
 
       content:
-        normalizeWhitespace(
+        cleanText(
           data.knowledge.content
         )
     },
 
+
     question: {
+
       heading:
-        "నేటి ప్రశ్న",
+        'నేటి ప్రశ్న',
 
       question:
-        normalizeWhitespace(
+        cleanText(
           data.question.question
         ),
 
       answer:
-        normalizeWhitespace(
+        cleanText(
           data.question.answer
         )
     }
   };
 }
 
-/* =========================================================
-   COMPLETE VALIDATION
-   ========================================================= */
 
-function validateEverything(
+// ============================================================
+// VALIDATION
+// ============================================================
+
+function validateContent(
   data
 ) {
-  validateStructure(
-    data
-  );
 
-  validateCardFields(
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    Array.isArray(data)
+  ) {
+
+    throw new Error(
+      'Generated content must be an object.'
+    );
+  }
+
+
+  /*
+   * EXACT top-level structure.
+   */
+  const expectedTopLevelKeys = [
+
+    'date',
+    'language',
+    'publisher',
+
+    'quote',
+    'health',
+    'science',
+    'knowledge',
+    'question'
+  ];
+
+
+  const actualKeys =
+    Object.keys(
+      data
+    ).sort();
+
+
+  const expectedKeys =
+    [...expectedTopLevelKeys]
+      .sort();
+
+
+  if (
+    JSON.stringify(actualKeys) !==
+    JSON.stringify(expectedKeys)
+  ) {
+
+    throw new Error(
+      `Unexpected top-level fields. ` +
+      `Expected: ${expectedKeys.join(', ')}. ` +
+      `Actual: ${actualKeys.join(', ')}.`
+    );
+  }
+
+
+  /*
+   * Explicitly reject culture.
+   */
+  if (
+    Object.prototype.hasOwnProperty.call(
+      data,
+      'culture'
+    )
+  ) {
+
+    throw new Error(
+      'The culture field is forbidden.'
+    );
+  }
+
+
+  /*
+   * Metadata.
+   */
+  if (
+    data.date !==
+    TARGET_DATE
+  ) {
+
+    throw new Error(
+      `Invalid date. Expected ${TARGET_DATE}.`
+    );
+  }
+
+
+  if (
+    data.language !==
+    'te'
+  ) {
+
+    throw new Error(
+      'language must be exactly "te".'
+    );
+  }
+
+
+  if (
+    data.publisher !==
+    'Vidhwaan'
+  ) {
+
+    throw new Error(
+      'publisher must be exactly "Vidhwaan".'
+    );
+  }
+
+
+  /*
+   * Section validation.
+   */
+  validateSection(
     data.quote,
-    "quote",
+    'quote',
+    'నేటి సూక్తి',
     [
-      "heading",
-      "title",
-      "content",
-      "attribution"
+      'heading',
+      'title',
+      'content',
+      'attribution'
     ]
   );
 
-  validateCardFields(
+
+  validateSection(
     data.health,
-    "health",
+    'health',
+    'నేటి ఆరోగ్యం',
     [
-      "heading",
-      "title",
-      "content"
+      'heading',
+      'title',
+      'content'
     ]
   );
 
-  validateCardFields(
+
+  validateSection(
     data.science,
-    "science",
+    'science',
+    'నేటి విజ్ఞానం',
     [
-      "heading",
-      "title",
-      "content"
+      'heading',
+      'title',
+      'content'
     ]
   );
 
-  validateCardFields(
+
+  validateSection(
     data.knowledge,
-    "knowledge",
+    'knowledge',
+    'నేటి జ్ఞానం',
     [
-      "heading",
-      "title",
-      "content"
+      'heading',
+      'title',
+      'content'
     ]
   );
 
-  validateCardFields(
+
+  validateSection(
     data.question,
-    "question",
+    'question',
+    'నేటి ప్రశ్న',
     [
-      "heading",
-      "question",
-      "answer"
+      'heading',
+      'question',
+      'answer'
     ]
   );
 
-  validateHeadings(
-    data
+
+  /*
+   * Quote.
+   */
+  if (
+    cleanText(
+      data.quote.attribution
+    ) !==
+    'Vidhwaan'
+  ) {
+
+    throw new Error(
+      'Quote attribution must be exactly "Vidhwaan".'
+    );
+  }
+
+
+  /*
+   * General text safety.
+   */
+  const allText = [
+
+    data.quote.title,
+    data.quote.content,
+    data.quote.attribution,
+
+    data.health.title,
+    data.health.content,
+
+    data.science.title,
+    data.science.content,
+
+    data.knowledge.title,
+    data.knowledge.content,
+
+    data.question.question,
+    data.question.answer
+
+  ].join(' ');
+
+
+  validateGeneralText(
+    allText
   );
 
-  validateLanguage(
-    data
-  );
 
-  validateQuote(
-    data
-  );
-
+  /*
+   * Health-specific safety.
+   */
   validateHealth(
-    data
+    data.health
   );
 
+
+  /*
+   * Science-specific safety.
+   */
   validateScience(
-    data
+    data.science
   );
 
+
+  /*
+   * Knowledge-specific safety.
+   */
   validateKnowledge(
-    data
+    data.knowledge
   );
 
+
+  /*
+   * Question-specific safety.
+   */
   validateQuestion(
+    data.question
+  );
+
+
+  /*
+   * Content length.
+   */
+  validateContentLengths(
     data
   );
 
-  validateGeneralQuality(
-    data
-  );
 
-  validateInternalCardDifference(
-    data
-  );
-
-  validateRecentRepetition(
-    data
-  );
+  return true;
 }
 
-/* =========================================================
-   GENERATION WITH RETRIES
-   ========================================================= */
 
-async function generateDailyContent() {
-  let lastError =
-    null;
+// ============================================================
+// SECTION VALIDATION
+// ============================================================
+
+function validateSection(
+  section,
+  name,
+  heading,
+  fields
+) {
+
+  if (
+    !section ||
+    typeof section !== 'object' ||
+    Array.isArray(section)
+  ) {
+
+    throw new Error(
+      `${name} must be an object.`
+    );
+  }
+
+
+  const actual =
+    Object.keys(
+      section
+    ).sort();
+
+
+  const expected =
+    [...fields].sort();
+
+
+  if (
+    JSON.stringify(actual) !==
+    JSON.stringify(expected)
+  ) {
+
+    throw new Error(
+      `${name} has unexpected fields. ` +
+      `Expected: ${expected.join(', ')}. ` +
+      `Actual: ${actual.join(', ')}.`
+    );
+  }
+
+
+  if (
+    section.heading !==
+    heading
+  ) {
+
+    throw new Error(
+      `${name}.heading must be "${heading}".`
+    );
+  }
+
 
   for (
-    let attempt = 1;
-    attempt <=
-    MAX_GENERATION_ATTEMPTS;
-    attempt++
+    const field of fields
   ) {
-    console.log("");
 
-    console.log(
-      "========================================"
+    if (
+      typeof section[field] !==
+      'string'
+    ) {
+
+      throw new Error(
+        `${name}.${field} must be a string.`
+      );
+    }
+
+
+    if (
+      section[field].trim() === ''
+    ) {
+
+      throw new Error(
+        `${name}.${field} cannot be empty.`
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// GENERAL TEXT VALIDATION
+// ============================================================
+
+function validateGeneralText(
+  text
+) {
+
+  const value =
+    String(
+      text || ''
     );
 
-    console.log(
-      `GENERATION ATTEMPT ${attempt}/${MAX_GENERATION_ATTEMPTS}`
+
+  /*
+   * URLs.
+   */
+  if (
+    /https?:\/\//i.test(
+      value
+    )
+  ) {
+
+    throw new Error(
+      'URLs are not allowed in published content.'
     );
+  }
 
-    console.log(
-      `Date: ${TARGET_DATE}`
+
+  /*
+   * Hashtags.
+   */
+  if (
+    /(^|\s)#\S+/.test(
+      value
+    )
+  ) {
+
+    throw new Error(
+      'Hashtags are not allowed in published content.'
     );
+  }
 
-    console.log(
-      `Model: ${GROQ_MODEL}`
+
+  /*
+   * Markdown/code formatting.
+   */
+  if (
+    /```/.test(
+      value
+    ) ||
+    /\*\*[^*]+\*\*/.test(
+      value
+    )
+  ) {
+
+    throw new Error(
+      'Markdown/code formatting is not allowed.'
     );
+  }
 
-    console.log(
-      `Reasoning: ${REASONING_EFFORT}`
-    );
 
-    console.log(
-      "========================================"
-    );
+  /*
+   * Internal technical terms.
+   */
+  const forbiddenTerms = [
 
-    try {
-      const generated =
-        await requestGroq();
+    'Groq',
+    'OpenAI',
+    'GPT',
+    'prompt',
+    'schema',
+    'API',
+    'GitHub',
+    'JSON',
+    'language model',
+    'AI model',
+    'system message',
+    'system prompt',
+    'response_format'
+  ];
 
-      /*
-       * Metadata is controlled by the application,
-       * not the model.
-       */
-      generated.date =
-        TARGET_DATE;
 
-      generated.language =
-        "te";
+  for (
+    const term of forbiddenTerms
+  ) {
 
-      generated.publisher =
-        "Vidhwaan";
+    if (
+      value
+        .toLowerCase()
+        .includes(
+          term.toLowerCase()
+        )
+    ) {
 
-      const normalized =
-        normalizeOutput(
-          generated
-        );
-
-      validateEverything(
-        normalized
+      throw new Error(
+        `Internal/technical term detected: ${term}`
       );
-
-      console.log("");
-
-      console.log(
-        "========================================"
-      );
-
-      console.log(
-        "PUBLICATION QUALITY GATE PASSED"
-      );
-
-      console.log(
-        "========================================"
-      );
-
-      return normalized;
-
-    } catch (error) {
-      lastError =
-        error;
-
-      console.error("");
-
-      console.error(
-        `Attempt ${attempt} rejected:`
-      );
-
-      console.error(
-        error.message
-      );
-
-      if (
-        attempt <
-        MAX_GENERATION_ATTEMPTS
-      ) {
-        console.log("");
-
-        console.log(
-          "The content was NOT published."
-        );
-
-        console.log(
-          "Generating a fresh attempt..."
-        );
-      }
     }
   }
 
-  throw new Error(
-    `All ${MAX_GENERATION_ATTEMPTS} attempts failed. No daily JSON was created. Last error: ${
-      lastError?.message ||
-      "Unknown error"
-    }`
-  );
-}
 
-/* =========================================================
-   ATOMIC WRITE
-   ========================================================= */
-
-function writeAtomically(
-  data
-) {
   /*
-   * Final race-condition protection.
+   * Empty or repeated whitespace.
    */
   if (
-    fs.existsSync(
-      OUTPUT_FILE
+    /\n{4,}/.test(
+      value
     )
   ) {
-    fail(
-      `Refusing to overwrite existing file: ${OUTPUT_FILE}`
+
+    throw new Error(
+      'Excessive blank lines detected.'
+    );
+  }
+}
+
+
+// ============================================================
+// HEALTH VALIDATION
+// ============================================================
+
+function validateHealth(
+  health
+) {
+
+  const text = [
+
+    health.title,
+    health.content
+
+  ].join(' ');
+
+
+  /*
+   * Known unsafe / overbroad claims.
+   */
+  const forbiddenPatterns = [
+
+    /8\s*గ్లాస్/i,
+
+    /8\s*గ్లాసుల/i,
+
+    /2\s*లీటర్/i,
+
+    /కచ్చితంగా.*నీరు/i,
+
+    /తప్పనిసరిగా.*నీరు/i,
+
+    /మందు.*ఆప/i,
+
+    /మందులు.*ఆప/i,
+
+    /మందు.*వాడకండి/i,
+
+    /మందులు.*వాడకండి/i,
+
+    /రోగం.*నయం/i,
+
+    /వ్యాధి.*నయం/i,
+
+    /శాశ్వతంగా.*నయం/i,
+
+    /100\s*%\s*నయం/i,
+
+    /అద్భుత.*చికిత్స/i,
+
+    /మిరాకిల్.*చికిత్స/i,
+
+    /చికిత్స.*హామీ/i
+  ];
+
+
+  for (
+    const pattern of forbiddenPatterns
+  ) {
+
+    if (
+      pattern.test(
+        text
+      )
+    ) {
+
+      throw new Error(
+        `Potentially unsafe health claim detected: ${pattern}`
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// SCIENCE VALIDATION
+// ============================================================
+
+function validateScience(
+  science
+) {
+
+  const text = [
+
+    science.title,
+    science.content
+
+  ].join(' ');
+
+
+  /*
+   * Prevent obvious uncertainty from being
+   * presented as established science.
+   */
+  const problematicPatterns = [
+
+    /బహుశా.*శాస్త్రీయంగా/i,
+
+    /అంటారు.*నిజం/i,
+
+    /అని.*నిరూపించబడలేదు/i,
+
+    /శాస్త్రవేత్తలు.*తెలియదు.*కానీ/i
+  ];
+
+
+  for (
+    const pattern of problematicPatterns
+  ) {
+
+    if (
+      pattern.test(
+        text
+      )
+    ) {
+
+      throw new Error(
+        'Science content contains an uncertain/speculative formulation.'
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// KNOWLEDGE VALIDATION
+// ============================================================
+
+function validateKnowledge(
+  knowledge
+) {
+
+  const text = [
+
+    knowledge.title,
+    knowledge.content
+
+  ].join(' ');
+
+
+  /*
+   * Specific known historical misinformation
+   * that appeared in earlier generated content.
+   */
+  if (
+    /1911/.test(
+      text
+    ) &&
+    /మౌంట్‌బాటన్|మౌంట్బాటన్|Mountbatten/i.test(
+      text
+    )
+  ) {
+
+    throw new Error(
+      'Invalid Mountbatten/1911 Indian capital claim detected.'
     );
   }
 
+
+  /*
+   * Do not allow obvious fabricated attribution
+   * patterns.
+   */
+  if (
+    /అన్నారు.*అని.*చెప్పారు.*అయితే/i.test(
+      text
+    )
+  ) {
+
+    throw new Error(
+      'Potentially fabricated historical attribution detected.'
+    );
+  }
+}
+
+
+// ============================================================
+// QUESTION VALIDATION
+// ============================================================
+
+function validateQuestion(
+  question
+) {
+
+  const questionText =
+    question.question.trim();
+
+  const answer =
+    question.answer.trim();
+
+
+  if (
+    questionText.length <
+    15
+  ) {
+
+    throw new Error(
+      'Question is too short.'
+    );
+  }
+
+
+  if (
+    answer.length ===
+    0
+  ) {
+
+    throw new Error(
+      'Question answer is empty.'
+    );
+  }
+
+
+  /*
+   * Reject English sentence answers.
+   *
+   * Pure numbers, units, mathematical expressions,
+   * Telugu answers and short named answers are allowed.
+   */
+  if (
+    /^[A-Za-z][A-Za-z\s,'".!?-]{8,}$/.test(
+      answer
+    )
+  ) {
+
+    throw new Error(
+      'Question answer appears to be an English sentence.'
+    );
+  }
+
+
+  /*
+   * Reject common ambiguous answer phrases.
+   */
+  const ambiguousPatterns = [
+
+    /^తెలియదు$/i,
+
+    /^బహుశా$/i,
+
+    /^అవకాశం ఉంది$/i,
+
+    /^అనేక$/i,
+
+    /^ఏదైనా$/i
+  ];
+
+
+  for (
+    const pattern of ambiguousPatterns
+  ) {
+
+    if (
+      pattern.test(
+        answer
+      )
+    ) {
+
+      throw new Error(
+        'Question answer is ambiguous.'
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// CONTENT LENGTH VALIDATION
+// ============================================================
+
+function validateContentLengths(
+  data
+) {
+
+  const limits = [
+
+    [
+      'quote.title',
+      data.quote.title,
+      100
+    ],
+
+    [
+      'quote.content',
+      data.quote.content,
+      500
+    ],
+
+    [
+      'health.title',
+      data.health.title,
+      100
+    ],
+
+    [
+      'health.content',
+      data.health.content,
+      700
+    ],
+
+    [
+      'science.title',
+      data.science.title,
+      100
+    ],
+
+    [
+      'science.content',
+      data.science.content,
+      700
+    ],
+
+    [
+      'knowledge.title',
+      data.knowledge.title,
+      100
+    ],
+
+    [
+      'knowledge.content',
+      data.knowledge.content,
+      700
+    ],
+
+    [
+      'question.question',
+      data.question.question,
+      800
+    ],
+
+    [
+      'question.answer',
+      data.question.answer,
+      200
+    ]
+  ];
+
+
+  for (
+    const [
+      name,
+      value,
+      max
+    ] of limits
+  ) {
+
+    if (
+      String(value).length >
+      max
+    ) {
+
+      throw new Error(
+        `${name} is too long. Maximum ${max} characters.`
+      );
+    }
+  }
+}
+
+
+// ============================================================
+// RECENT CONTENT
+// ============================================================
+
+function readRecentContent() {
+
+  if (
+    !fs.existsSync(
+      DATA_DIR
+    )
+  ) {
+
+    return '';
+  }
+
+
+  const files =
+    fs.readdirSync(
+      DATA_DIR
+    )
+      .filter(
+        file =>
+          /^\d{4}-\d{2}-\d{2}\.json$/
+            .test(file)
+      )
+      .filter(
+        file =>
+          file !==
+          `${TARGET_DATE}.json`
+      )
+      .sort()
+      .reverse()
+      .slice(
+        0,
+        MAX_RECENT_FILES
+      );
+
+
+  if (
+    files.length ===
+    0
+  ) {
+
+    console.log(
+      'Recent JSON files: 0'
+    );
+
+    return '';
+  }
+
+
+  console.log(
+    `Recent JSON files: ${files.length}`
+  );
+
+
+  const output = [];
+
+
+  for (
+    const file of files
+  ) {
+
+    const fullPath =
+      path.join(
+        DATA_DIR,
+        file
+      );
+
+
+    try {
+
+      const raw =
+        fs.readFileSync(
+          fullPath,
+          'utf8'
+        );
+
+
+      const parsed =
+        JSON.parse(
+          raw
+        );
+
+
+      output.push(
+        JSON.stringify(
+          parsed
+        )
+      );
+
+
+    } catch (
+      error
+    ) {
+
+      console.warn(
+        `Warning: Could not read recent file ${file}: ${error.message}`
+      );
+    }
+  }
+
+
+  return output.join(
+    '\n'
+  );
+}
+
+
+// ============================================================
+// ATOMIC JSON WRITE
+// ============================================================
+
+async function writeAtomicJson(
+  outputFile,
+  data
+) {
+
+  /*
+   * Final safety check before touching disk.
+   */
+  validateContent(
+    data
+  );
+
+
+  /*
+   * NEVER replace an existing file.
+   */
+  if (
+    fs.existsSync(
+      outputFile
+    )
+  ) {
+
+    throw new Error(
+      `Refusing to overwrite existing file: ${outputFile}`
+    );
+  }
+
+
   const temporaryFile =
-    `${OUTPUT_FILE}.${process.pid}.tmp`;
+    `${outputFile}.tmp-${process.pid}-${Date.now()}`;
+
 
   const json =
     JSON.stringify(
       data,
       null,
       2
-    ) + "\n";
+    ) + '\n';
+
 
   try {
+
     fs.writeFileSync(
       temporaryFile,
       json,
-      "utf8"
+      {
+        encoding: 'utf8',
+        flag: 'wx'
+      }
     );
 
+
     /*
-     * Verify the exact temporary file
-     * before it becomes official.
+     * Verify the temporary file before publication.
      */
-    const verification =
+    const written =
       fs.readFileSync(
         temporaryFile,
-        "utf8"
+        'utf8'
       );
+
 
     const parsed =
       JSON.parse(
-        verification
+        written
       );
 
-    validateEverything(
+
+    validateContent(
       parsed
     );
 
+
     /*
-     * Only now does it become the official file.
+     * Rename is atomic on the same filesystem.
      */
     fs.renameSync(
       temporaryFile,
-      OUTPUT_FILE
+      outputFile
     );
 
-  } catch (error) {
-    try {
-      if (
-        fs.existsSync(
-          temporaryFile
-        )
-      ) {
+
+  } catch (
+    error
+  ) {
+
+    if (
+      fs.existsSync(
+        temporaryFile
+      )
+    ) {
+
+      try {
+
         fs.unlinkSync(
           temporaryFile
         );
-      }
-    } catch {
-      // Ignore cleanup errors.
+
+      } catch {}
     }
+
 
     throw error;
   }
 }
 
-/* =========================================================
-   FINAL FILE VERIFICATION
-   ========================================================= */
 
-function verifyFinalFile() {
+// ============================================================
+// VERIFY WRITTEN FILE
+// ============================================================
+
+function verifyWrittenFile(
+  file
+) {
+
   if (
     !fs.existsSync(
-      OUTPUT_FILE
+      file
     )
   ) {
-    fail(
-      "Final daily JSON was not created."
+
+    throw new Error(
+      `Generated file was not found after publication: ${file}`
     );
   }
 
+
   const raw =
     fs.readFileSync(
-      OUTPUT_FILE,
-      "utf8"
+      file,
+      'utf8'
     );
 
-  const parsed =
-    JSON.parse(
-      raw
-    );
 
-  validateEverything(
+  if (
+    raw.trim() ===
+    ''
+  ) {
+
+    throw new Error(
+      `Generated file is empty: ${file}`
+    );
+  }
+
+
+  let parsed;
+
+  try {
+
+    parsed =
+      JSON.parse(
+        raw
+      );
+
+  } catch (
+    error
+  ) {
+
+    throw new Error(
+      `Written JSON is invalid: ${error.message}`
+    );
+  }
+
+
+  validateContent(
     parsed
   );
 
-  console.log("");
 
+  console.log('');
   console.log(
-    "========================================"
+    `Verified JSON: ${file}`
   );
 
   console.log(
-    "FINAL FILE VERIFICATION PASSED"
-  );
-
-  console.log(
-    "========================================"
-  );
-
-  console.log(
-    `File: ${OUTPUT_FILE}`
-  );
-
-  console.log(
-    `Size: ${Buffer.byteLength(
-      raw,
-      "utf8"
-    )} bytes`
-  );
-
-  console.log(
-    "Cards: 5"
-  );
-
-  console.log(
-    "Language: Telugu"
-  );
-
-  console.log(
-    "Publisher: Vidhwaan"
-  );
-
-  console.log(
-    "Structure: VALID"
-  );
-
-  console.log(
-    "Quality gate: PASSED"
-  );
-
-  console.log(
-    "Publication status: APPROVED"
+    `File size: ${Buffer.byteLength(raw, 'utf8')} bytes`
   );
 }
 
-/* =========================================================
-   MAIN
-   ========================================================= */
 
-async function main() {
-  console.log("");
+// ============================================================
+// CLEAN TEXT
+// ============================================================
 
-  console.log(
-    "========================================"
+function cleanText(
+  value
+) {
+
+  return String(
+    value ?? ''
+  )
+    .replace(
+      /\s+/g,
+      ' '
+    )
+    .trim();
+}
+
+
+// ============================================================
+// DATE
+// ============================================================
+
+function getIndiaDate() {
+
+  const formatter =
+    new Intl.DateTimeFormat(
+      'en-CA',
+      {
+        timeZone:
+          'Asia/Kolkata',
+
+        year:
+          'numeric',
+
+        month:
+          '2-digit',
+
+        day:
+          '2-digit'
+      }
+    );
+
+
+  return formatter.format(
+    new Date()
   );
+}
 
-  console.log(
-    "VIDHWAAN DAILY SOCIAL"
-  );
 
-  console.log(
-    "PRODUCTION CONTENT GENERATOR"
-  );
+function isValidDate(
+  value
+) {
 
-  console.log(
-    "========================================"
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})$/
+      .exec(
+        value
+      );
+
+
+  if (!match) {
+    return false;
+  }
+
+
+  const year =
+    Number(
+      match[1]
+    );
+
+  const month =
+    Number(
+      match[2]
+    );
+
+  const day =
+    Number(
+      match[3]
+    );
+
+
+  const date =
+    new Date(
+      Date.UTC(
+        year,
+        month - 1,
+        day
+      )
+    );
+
+
+  return (
+
+    date.getUTCFullYear() ===
+      year &&
+
+    date.getUTCMonth() ===
+      month - 1 &&
+
+    date.getUTCDate() ===
+      day
+
   );
+}
+
+
+// ============================================================
+// FILESYSTEM
+// ============================================================
+
+function ensureDataDirectory() {
+
+  if (
+    !fs.existsSync(
+      DATA_DIR
+    )
+  ) {
+
+    fs.mkdirSync(
+      DATA_DIR,
+      {
+        recursive:
+          true
+      }
+    );
+  }
+}
+
+
+// ============================================================
+// HEADER
+// ============================================================
+
+function printHeader() {
+
+  console.log('');
+  console.log('========================================');
+  console.log('VIDHWAAN DAILY SOCIAL');
+  console.log('PRODUCTION CONTENT GENERATOR');
+  console.log('========================================');
 
   console.log(
     `Publication date: ${TARGET_DATE}`
   );
 
   console.log(
-    "Timezone: Asia/Kolkata"
+    'Timezone: Asia/Kolkata'
   );
 
   console.log(
-    `Model: ${GROQ_MODEL}`
+    `Model: ${MODEL}`
   );
 
   console.log(
-    `Reasoning: ${REASONING_EFFORT}`
+    'Reasoning: high'
   );
 
   console.log(
-    `Recent JSON files: ${recentContent.length}`
+    'Cards: 5'
   );
 
-  console.log(
-    "Cards: 5"
-  );
+  console.log('========================================');
+}
 
-  console.log(
-    "========================================"
-  );
 
-  const content =
-    await generateDailyContent();
+// ============================================================
+// SLEEP
+// ============================================================
 
-  writeAtomically(
-    content
-  );
+function sleep(
+  ms
+) {
 
-  verifyFinalFile();
-
-  console.log("");
-
-  console.log(
-    "========================================"
-  );
-
-  console.log(
-    "FINAL GENERATED JSON"
-  );
-
-  console.log(
-    "========================================"
-  );
-
-  console.log(
-    JSON.stringify(
-      content,
-      null,
-      2
-    )
-  );
-
-  console.log("");
-
-  console.log(
-    "SUCCESS: Daily JSON generated and approved."
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
   );
 }
 
-/* =========================================================
-   START
-   ========================================================= */
+
+// ============================================================
+// DURATION FORMAT
+// ============================================================
+
+function formatDuration(
+  milliseconds
+) {
+
+  const totalSeconds =
+    Math.ceil(
+      milliseconds / 1000
+    );
+
+
+  if (
+    totalSeconds <
+    60
+  ) {
+
+    return `${totalSeconds} seconds`;
+  }
+
+
+  const minutes =
+    Math.floor(
+      totalSeconds / 60
+    );
+
+  const seconds =
+    totalSeconds % 60;
+
+
+  if (
+    seconds ===
+    0
+  ) {
+
+    return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  }
+
+
+  return (
+    `${minutes} minute${minutes === 1 ? '' : 's'} ` +
+    `${seconds} seconds`
+  );
+}
+
+
+// ============================================================
+// FAIL
+// ============================================================
+
+function fail(
+  message
+) {
+
+  console.error('');
+  console.error('========================================');
+  console.error('VIDHWAAN DAILY SOCIAL');
+  console.error('GENERATION FAILED');
+  console.error('========================================');
+  console.error('');
+  console.error(message);
+  console.error('');
+  console.error(
+    'IMPORTANT: No questionable or incomplete JSON was published.'
+  );
+  console.error('');
+
+  process.exit(
+    1
+  );
+}
+
+
+// ============================================================
+// GLOBAL ERRORS
+// ============================================================
+
+process.on(
+  'unhandledRejection',
+  error => {
+
+    fail(
+      error?.message ||
+      String(error)
+    );
+  }
+);
+
+
+process.on(
+  'uncaughtException',
+  error => {
+
+    fail(
+      error?.message ||
+      String(error)
+    );
+  }
+);
+
+
+// ============================================================
+// START
+// ============================================================
 
 main().catch(
-  (error) => {
-    console.error("");
+  error => {
 
-    console.error(
-      "========================================"
+    fail(
+      error?.message ||
+      String(error)
     );
-
-    console.error(
-      "VIDHWAAN DAILY SOCIAL"
-    );
-
-    console.error(
-      "GENERATION FAILED"
-    );
-
-    console.error(
-      "========================================"
-    );
-
-    console.error(
-      error.stack ||
-      error.message
-    );
-
-    console.error("");
-
-    console.error(
-      "IMPORTANT:"
-    );
-
-    console.error(
-      "No questionable or incomplete JSON was published."
-    );
-
-    /*
-     * Clean up any possible temporary file.
-     */
-    try {
-      const temporaryFile =
-        `${OUTPUT_FILE}.${process.pid}.tmp`;
-
-      if (
-        fs.existsSync(
-          temporaryFile
-        )
-      ) {
-        fs.unlinkSync(
-          temporaryFile
-        );
-      }
-    } catch {
-      // Ignore cleanup failure.
-    }
-
-    process.exit(1);
   }
 );
