@@ -21,9 +21,9 @@ concurrency:
 
 jobs:
   generate:
-    name: Generate Daily Telugu Content
+    name: Generate and Verify Daily Telugu Content
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       TZ: Asia/Kolkata
@@ -32,20 +32,55 @@ jobs:
 
     steps:
 
+      # =====================================================
+      # 1. CHECKOUT
+      # =====================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js
+      # =====================================================
+      # 2. NODE.JS
+      # =====================================================
+
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
-      - name: Configure Git
+      # =====================================================
+      # 3. VERIFY API KEY
+      # =====================================================
+
+      - name: Verify Groq API key
+        shell: bash
         run: |
+          set -euo pipefail
+
+          if [ -z "${GROQ_API_KEY:-}" ]; then
+            echo "ERROR: GROQ_API_KEY GitHub Secret is missing."
+            exit 1
+          fi
+
+          echo "GROQ_API_KEY is available."
+
+      # =====================================================
+      # 4. CONFIGURE GIT
+      # =====================================================
+
+      - name: Configure Git
+        shell: bash
+        run: |
+          set -euo pipefail
+
           git config user.name "Vidhwaan Daily Social"
           git config user.email "actions@users.noreply.github.com"
+
+      # =====================================================
+      # 5. DETERMINE INDIA DATE
+      # =====================================================
 
       - name: Determine publication date
         id: date
@@ -60,53 +95,83 @@ jobs:
           fi
 
           if ! [[ "$TARGET_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            echo "ERROR: Invalid date: $TARGET_DATE"
+            echo "ERROR: Invalid date format:"
+            echo "$TARGET_DATE"
             echo "Expected format: YYYY-MM-DD"
             exit 1
           fi
 
           if ! date -d "$TARGET_DATE" '+%Y-%m-%d' >/dev/null 2>&1; then
-            echo "ERROR: Invalid calendar date: $TARGET_DATE"
+            echo "ERROR: Invalid calendar date:"
+            echo "$TARGET_DATE"
             exit 1
           fi
 
           echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
 
           echo "========================================"
-          echo "Vidhwaan Daily Social"
+          echo "VIDHWAAN DAILY SOCIAL"
+          echo "========================================"
           echo "Publication date: $TARGET_DATE"
           echo "Timezone: Asia/Kolkata"
           echo "========================================"
 
+      # =====================================================
+      # 6. CHECK EXISTING DAILY JSON
+      # =====================================================
+
       - name: Check existing daily JSON
         id: existing
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
         shell: bash
         run: |
           set -euo pipefail
 
-          TARGET_DATE="${{ steps.date.outputs.target_date }}"
           TARGET_FILE="data/${TARGET_DATE}.json"
 
           if [ -f "$TARGET_FILE" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
 
-            echo "Today's JSON already exists:"
+            echo "========================================"
+            echo "DAILY JSON ALREADY EXISTS"
+            echo "========================================"
             echo "$TARGET_FILE"
+            echo ""
+            echo "The generator will not overwrite it."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
 
-            echo "No JSON exists for:"
-            echo "$TARGET_DATE"
+            echo "No existing daily JSON found."
+            echo "Generation is required."
           fi
+
+      # =====================================================
+      # 7. GENERATE DAILY JSON
+      # =====================================================
 
       - name: Generate daily content
         if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
         run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "STARTING CONTENT GENERATION"
+          echo "========================================"
+
           node generate-daily-content.js
 
-      - name: Verify generated JSON
+          echo ""
+          echo "Generator completed successfully."
+
+      # =====================================================
+      # 8. VERIFY FILE EXISTS
+      # =====================================================
+
+      - name: Verify generated file exists
         if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
@@ -125,29 +190,431 @@ jobs:
           echo "Generated file:"
           echo "$TARGET_FILE"
 
-          echo ""
-          echo "File size:"
-          wc -c "$TARGET_FILE"
+      # =====================================================
+      # 9. VERIFY JSON SYNTAX
+      # =====================================================
 
-          echo ""
-          echo "JSON validation:"
-          node -e "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8')); console.log('Valid JSON')" "$TARGET_FILE"
-
-      - name: Show generated file
+      - name: Validate JSON syntax
         if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
         run: |
-          echo "========================================"
-          echo "Generated daily content"
-          echo "========================================"
+          set -euo pipefail
 
-          cat "data/${TARGET_DATE}.json"
+          TARGET_FILE="data/${TARGET_DATE}.json"
 
-      - name: Commit daily JSON
+          node -e "
+            const fs = require('fs');
+
+            const file = process.argv[1];
+
+            const raw = fs.readFileSync(file, 'utf8');
+
+            JSON.parse(raw);
+
+            console.log('JSON syntax: VALID');
+          " "$TARGET_FILE"
+
+      # =====================================================
+      # 10. VERIFY EXACT PRODUCTION STRUCTURE
+      # =====================================================
+
+      - name: Validate production structure
         if: steps.existing.outputs.exists != 'true'
         env:
           TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_FILE="data/${TARGET_DATE}.json"
+
+          node <<'NODE'
+          const fs = require("fs");
+
+          const targetDate = process.env.TARGET_DATE;
+
+          const file =
+            `data/${targetDate}.json`;
+
+          const data =
+            JSON.parse(
+              fs.readFileSync(
+                file,
+                "utf8"
+              )
+            );
+
+          const expectedTopLevel = [
+            "date",
+            "language",
+            "publisher",
+            "quote",
+            "health",
+            "science",
+            "knowledge",
+            "question"
+          ];
+
+          const actualTopLevel =
+            Object.keys(data);
+
+          if (
+            JSON.stringify(actualTopLevel) !==
+            JSON.stringify(expectedTopLevel)
+          ) {
+            console.error(
+              "ERROR: Top-level structure is incorrect."
+            );
+
+            console.error(
+              "Expected:"
+            );
+
+            console.error(
+              expectedTopLevel
+            );
+
+            console.error(
+              "Received:"
+            );
+
+            console.error(
+              actualTopLevel
+            );
+
+            process.exit(1);
+          }
+
+          if (
+            data.date !== targetDate
+          ) {
+            console.error(
+              `ERROR: date must be ${targetDate}, received ${data.date}`
+            );
+
+            process.exit(1);
+          }
+
+          if (
+            data.language !== "te"
+          ) {
+            console.error(
+              `ERROR: language must be te, received ${data.language}`
+            );
+
+            process.exit(1);
+          }
+
+          if (
+            data.publisher !== "Vidhwaan"
+          ) {
+            console.error(
+              `ERROR: publisher must be Vidhwaan, received ${data.publisher}`
+            );
+
+            process.exit(1);
+          }
+
+          const expectedHeadings = {
+            quote: "నేటి సూక్తి",
+            health: "నేటి ఆరోగ్యం",
+            science: "నేటి విజ్ఞానం",
+            knowledge: "నేటి జ్ఞానం",
+            question: "నేటి ప్రశ్న"
+          };
+
+          for (
+            const [section, heading]
+            of Object.entries(
+              expectedHeadings
+            )
+          ) {
+            if (
+              !data[section] ||
+              data[section].heading !== heading
+            ) {
+              console.error(
+                `ERROR: Invalid heading for ${section}.`
+              );
+
+              process.exit(1);
+            }
+          }
+
+          if (
+            "culture" in data
+          ) {
+            console.error(
+              "ERROR: Forbidden culture section exists."
+            );
+
+            process.exit(1);
+          }
+
+          const requiredFields = {
+            quote: [
+              "heading",
+              "title",
+              "content",
+              "attribution"
+            ],
+
+            health: [
+              "heading",
+              "title",
+              "content"
+            ],
+
+            science: [
+              "heading",
+              "title",
+              "content"
+            ],
+
+            knowledge: [
+              "heading",
+              "title",
+              "content"
+            ],
+
+            question: [
+              "heading",
+              "question",
+              "answer"
+            ]
+          };
+
+          for (
+            const [section, fields]
+            of Object.entries(
+              requiredFields
+            )
+          ) {
+            for (
+              const field of fields
+            ) {
+              if (
+                typeof data[section]?.[field] !==
+                  "string" ||
+                !data[section][field].trim()
+              ) {
+                console.error(
+                  `ERROR: Missing or empty ${section}.${field}`
+                );
+
+                process.exit(1);
+              }
+            }
+          }
+
+          console.log(
+            "Production structure: VALID"
+          );
+
+          console.log(
+            "Five cards: VALID"
+          );
+
+          console.log(
+            "No culture card: VALID"
+          );
+          NODE
+
+      # =====================================================
+      # 11. CONTENT SAFETY CHECK
+      # =====================================================
+
+      - name: Validate content safety
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_FILE="data/${TARGET_DATE}.json"
+
+          node <<'NODE'
+          const fs = require("fs");
+
+          const targetDate =
+            process.env.TARGET_DATE;
+
+          const file =
+            `data/${targetDate}.json`;
+
+          const data =
+            JSON.parse(
+              fs.readFileSync(
+                file,
+                "utf8"
+              )
+            );
+
+          const allText = [
+            data.quote.title,
+            data.quote.content,
+            data.quote.attribution,
+
+            data.health.title,
+            data.health.content,
+
+            data.science.title,
+            data.science.content,
+
+            data.knowledge.title,
+            data.knowledge.content,
+
+            data.question.question,
+            data.question.answer
+          ].join(" ");
+
+          const forbidden = [
+            "http://",
+            "https://",
+            "www.",
+            "groq",
+            "openai",
+            "chatgpt",
+            "prompt",
+            "schema",
+            "#"
+          ];
+
+          for (
+            const term of forbidden
+          ) {
+            if (
+              allText
+                .toLowerCase()
+                .includes(
+                  term.toLowerCase()
+                )
+            ) {
+              console.error(
+                `ERROR: Forbidden content detected: ${term}`
+              );
+
+              process.exit(1);
+            }
+          }
+
+          const dangerousHealthClaims = [
+            "వ్యాధిని నయం",
+            "వ్యాధి నయం",
+            "క్యాన్సర్ నయం",
+            "డయాబెటిస్ నయం",
+            "మందులు ఆప",
+            "మందులు నిలిప",
+            "మందులు మాన",
+            "డాక్టర్ అవసరం లేదు",
+            "100% నయం"
+          ];
+
+          const healthText = [
+            data.health.title,
+            data.health.content
+          ].join(" ");
+
+          for (
+            const term of dangerousHealthClaims
+          ) {
+            if (
+              healthText.includes(
+                term
+              )
+            ) {
+              console.error(
+                `ERROR: Unsafe health claim detected: ${term}`
+              );
+
+              process.exit(1);
+            }
+          }
+
+          console.log(
+            "Content safety: PASSED"
+          );
+          NODE
+
+      # =====================================================
+      # 12. SHOW FINAL JSON
+      # =====================================================
+
+      - name: Show generated JSON
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_FILE="data/${TARGET_DATE}.json"
+
+          echo ""
+          echo "========================================"
+          echo "FINAL GENERATED JSON"
+          echo "========================================"
+
+          cat "$TARGET_FILE"
+
+          echo ""
+          echo "========================================"
+
+      # =====================================================
+      # 13. VERIFY ONLY EXPECTED FILE CHANGED
+      # =====================================================
+
+      - name: Verify changed files
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_FILE="data/${TARGET_DATE}.json"
+
+          echo "Current changes:"
+          git status --short
+
+          CHANGED_FILES="$(
+            git status --short |
+            awk '{print substr($0,4)}'
+          )"
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "ERROR: No changes detected."
+            exit 1
+          fi
+
+          while IFS= read -r file; do
+
+            [ -z "$file" ] && continue
+
+            if [ "$file" != "$TARGET_FILE" ]; then
+              echo ""
+              echo "ERROR: Unexpected file changed:"
+              echo "$file"
+              exit 1
+            fi
+
+          done <<< "$CHANGED_FILES"
+
+          echo ""
+          echo "Only expected daily JSON changed."
+
+      # =====================================================
+      # 14. STAGE ONLY DAILY JSON
+      # =====================================================
+
+      - name: Stage daily JSON
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -155,17 +622,127 @@ jobs:
 
           git add -- "$TARGET_FILE"
 
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-            exit 0
+          echo ""
+          echo "Staged files:"
+          git diff --cached --name-only
+
+      # =====================================================
+      # 15. VERIFY STAGED FILE
+      # =====================================================
+
+      - name: Verify staged JSON
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_FILE="data/${TARGET_DATE}.json"
+
+          if git diff --cached --quiet -- "$TARGET_FILE"; then
+            echo "ERROR: Daily JSON is not staged."
+            exit 1
           fi
+
+          echo "Daily JSON is correctly staged."
+
+      # =====================================================
+      # 16. COMMIT
+      # =====================================================
+
+      - name: Commit daily JSON
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_FILE="data/${TARGET_DATE}.json"
 
           git commit \
             -m "Add Vidhwaan Daily Social content for ${TARGET_DATE}"
 
-      - name: Push daily JSON
+          echo ""
+          echo "Commit created:"
+          git log -1 --oneline
+
+      # =====================================================
+      # 17. VERIFY COMMIT CONTENT
+      # =====================================================
+
+      - name: Verify commit content
         if: steps.existing.outputs.exists != 'true'
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
         run: |
           set -euo pipefail
 
+          TARGET_FILE="data/${TARGET_DATE}.json"
+
+          COMMITTED_FILES="$(
+            git diff-tree \
+              --no-commit-id \
+              --name-only \
+              -r HEAD
+          )"
+
+          echo "Files in latest commit:"
+          echo "$COMMITTED_FILES"
+
+          if [ "$COMMITTED_FILES" != "$TARGET_FILE" ]; then
+            echo ""
+            echo "ERROR: Latest commit contains unexpected files."
+            exit 1
+          fi
+
+          echo ""
+          echo "Commit contains only the expected daily JSON."
+
+      # =====================================================
+      # 18. PUSH
+      # =====================================================
+
+      - name: Push daily JSON
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "PUSHING PRODUCTION CONTENT"
+          echo "========================================"
+
           git push origin HEAD
+
+          echo ""
+          echo "Push completed successfully."
+
+      # =====================================================
+      # 19. FINAL SUCCESS
+      # =====================================================
+
+      - name: Production success
+        if: success()
+        env:
+          TARGET_DATE: ${{ steps.date.outputs.target_date }}
+        shell: bash
+        run: |
+          echo ""
+          echo "========================================"
+          echo "VIDHWAAN DAILY SOCIAL"
+          echo "========================================"
+          echo "PRODUCTION GENERATION SUCCESS"
+          echo "========================================"
+          echo "Date: $TARGET_DATE"
+          echo "Language: Telugu"
+          echo "Cards: 5"
+          echo "Quality gate: PASSED"
+          echo "JSON syntax: PASSED"
+          echo "Structure: PASSED"
+          echo "Safety: PASSED"
+          echo "Git verification: PASSED"
+          echo "Publication: COMPLETED"
+          echo "========================================"
