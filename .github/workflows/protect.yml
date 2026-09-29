@@ -1,47 +1,57 @@
-name: Protect Frontend
+name: Protect and Deploy Frontend
 
 on:
-  workflow_dispatch:
-
   push:
+    branches:
+      - main
     paths-ignore:
       - "public/**"
       - ".github/workflows/protect.yml"
 
+  workflow_dispatch:
+
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
-  group: protect-frontend
+  group: "github-pages"
   cancel-in-progress: false
 
 jobs:
-  protect:
+  build:
+    name: Build Protected Public Files
     runs-on: ubuntu-latest
 
     steps:
-      # ==========================================================
-      # CHECKOUT
-      # ==========================================================
-
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          persist-credentials: true
-
-      # ==========================================================
-      # NODE.JS
-      # ==========================================================
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      # ==========================================================
-      # INSTALL DEPENDENCIES
-      # ==========================================================
+      - name: Show Node and npm Versions
+        run: |
+          set -e
+          node --version
+          npm --version
+
+      - name: Verify Required Source Files
+        run: |
+          set -e
+
+          test -f package.json
+          test -f scripts/protect.js
+          test -f index.html
+          test -f app.js
+          test -f main.css
+
+          echo "Required source files found."
 
       - name: Install Dependencies
         run: |
@@ -52,242 +62,119 @@ jobs:
             --no-fund \
             --package-lock=false
 
-      # ==========================================================
-      # VERIFY REQUIRED FILES
-      # ==========================================================
-
-      - name: Verify Protection Setup
+      - name: Record Source State Before Protection
         run: |
           set -e
 
-          echo "Checking required files..."
+          git status --porcelain=v1 --untracked-files=all > /tmp/source-before.txt
 
-          test -f package.json
-          test -f scripts/protect.js
+          echo "Source state recorded."
 
-          echo "Required files found."
-
-          echo
-          echo "Checking npm protect script..."
-
-          node -e "
-          const fs = require('fs');
-
-          const pkg = JSON.parse(
-            fs.readFileSync('package.json', 'utf8')
-          );
-
-          if (
-            !pkg.scripts ||
-            !pkg.scripts.protect
-          ) {
-            console.error(
-              'ERROR: package.json does not contain scripts.protect'
-            );
-
-            process.exit(1);
-          }
-
-          console.log(
-            'npm run protect:',
-            pkg.scripts.protect
-          );
-          "
-
-      # ==========================================================
-      # RECORD SOURCE STATE
-      # ==========================================================
-      #
-      # This gives us a clean baseline.
-      #
-      # The protection script must NEVER modify source files.
-      #
-      # ==========================================================
-
-      - name: Record Source State
+      - name: Run Protection Build
         run: |
           set -e
-
-          echo "Recording source repository state..."
-
-          git status --short
-
-          git diff --exit-code -- . ':!public' || {
-            echo
-            echo "ERROR: Repository already contains source changes."
-            echo "Protection requires a clean source tree."
-            exit 1
-          }
-
-          echo
-          echo "Source repository is clean."
-
-      # ==========================================================
-      # RUN PROTECTION
-      # ==========================================================
-
-      - name: Run Protection Pipeline
-        run: |
-          set -e
-
-          echo
-          echo "=============================================="
-          echo "       RUNNING VIDHWAAN PROTECTION"
-          echo "=============================================="
-          echo
 
           npm run protect
 
-      # ==========================================================
-      # VERIFY SOURCE WAS NOT MODIFIED
-      # ==========================================================
-
-      - name: Verify Source Files Are Unchanged
+      - name: Verify Source Files Were Not Modified
         run: |
           set -e
 
-          echo
-          echo "Checking that source files were not modified..."
-          echo
+          SOURCE_CHANGES="$(git status --porcelain=v1 --untracked-files=all -- . ':(exclude)public')"
 
-          if ! git diff --exit-code -- . ':!public'; then
-            echo
-            echo "ERROR: Protection pipeline modified source files."
-            echo
-            echo "Source files MUST remain unchanged."
-            echo "Only public/ is allowed to change."
-            echo
-
-            git status --short
-            git diff -- . ':!public'
-
+          if [ -n "$SOURCE_CHANGES" ]; then
+            echo "ERROR: Source files were modified outside public/"
+            echo "$SOURCE_CHANGES"
             exit 1
           fi
 
           echo "SUCCESS: Source files remain unchanged."
 
-      # ==========================================================
-      # VERIFY PUBLIC DIRECTORY
-      # ==========================================================
-
-      - name: Verify Public Output
+      - name: Verify Public Build
         run: |
           set -e
 
-          echo
-          echo "Checking public/ output..."
-          echo
-
           test -d public
+          test -f public/index.html
 
-          echo "public/ directory exists."
-
-          FILE_COUNT=$(find public -type f | wc -l)
-
-          echo "Public files: ${FILE_COUNT}"
-
-          if [ "${FILE_COUNT}" -eq 0 ]; then
-            echo "ERROR: public/ is empty."
+          if [ ! -s public/index.html ]; then
+            echo "ERROR: public/index.html is empty."
             exit 1
           fi
 
-          echo
-          echo "Public output verification passed."
+          echo "public/index.html exists and is non-empty."
 
-      # ==========================================================
-      # SHOW CHANGES
-      # ==========================================================
-
-      - name: Show Public Changes
+      - name: Verify Custom Domain
         run: |
           set -e
 
-          echo
-          echo "=============================================="
-          echo "              PUBLIC CHANGES"
-          echo "=============================================="
-          echo
+          if [ ! -f public/CNAME ]; then
+            echo "ERROR: public/CNAME was not generated."
+            exit 1
+          fi
 
-          git status --short
+          DOMAIN="$(tr -d '\r\n' < public/CNAME)"
 
-          echo
-          echo "Diff statistics:"
-          git diff --stat -- public || true
+          if [ "$DOMAIN" != "social.vidhwaan.com" ]; then
+            echo "ERROR: Incorrect CNAME."
+            echo "Expected: social.vidhwaan.com"
+            echo "Found:    $DOMAIN"
+            exit 1
+          fi
 
-      # ==========================================================
-      # CONFIGURE GIT
-      # ==========================================================
+          echo "CNAME verified: $DOMAIN"
 
-      - name: Configure Git
+      - name: Show Public Files
+        run: |
+          set -e
+
+          echo "Protected deployment files:"
+          find public -type f | sort
+
+      - name: Configure Git Identity
         run: |
           set -e
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # ==========================================================
-      # COMMIT ONLY PUBLIC
-      # ==========================================================
-      #
-      # IMPORTANT:
-      #
-      # Never use:
-      #
-      #   git add -A
-      #
-      # because that could commit source changes.
-      #
-      # Only public/ is staged.
-      #
-      # ==========================================================
-
-      - name: Commit Public Output
+      - name: Commit Protected Public Files
         run: |
           set -e
-
-          echo
-          echo "Staging ONLY public/..."
-          echo
 
           git add -f public/
 
-          echo
-          echo "Checking staged files..."
-          echo
-
-          git diff --cached --name-only
-
-          echo
-          echo "Verifying that only public/ is staged..."
-
-          INVALID_FILES=$(git diff --cached --name-only | grep -v '^public/' || true)
-
-          if [ -n "${INVALID_FILES}" ]; then
-            echo
-            echo "ERROR: Files outside public/ are staged:"
-            echo
-            echo "${INVALID_FILES}"
-            echo
-            exit 1
-          fi
-
-          echo
-          echo "Only public/ files are staged."
-
           if git diff --cached --quiet; then
-            echo
-            echo "No public changes detected."
-            exit 0
+            echo "No changes in public/. Nothing to commit."
+          else
+            git commit -m "Deploy protected frontend"
+            git push
           fi
 
-          git commit -m "Update protected public assets"
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
 
-      # ==========================================================
-      # PUSH
-      # ==========================================================
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./public
 
-      - name: Push Public Output
-        run: |
-          set -e
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
 
-          git push
+    needs: build
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy Pages Artifact
+        id: deployment
+        uses: actions/deploy-pages@v4
