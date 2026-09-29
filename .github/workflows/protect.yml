@@ -38,6 +38,7 @@ jobs:
       - name: Show Node and npm Versions
         run: |
           set -e
+
           node --version
           npm --version
 
@@ -62,14 +63,6 @@ jobs:
             --no-fund \
             --package-lock=false
 
-      - name: Record Source State Before Protection
-        run: |
-          set -e
-
-          git status --porcelain=v1 --untracked-files=all > /tmp/source-before.txt
-
-          echo "Source state recorded."
-
       - name: Run Protection Build
         run: |
           set -e
@@ -80,11 +73,23 @@ jobs:
         run: |
           set -e
 
-          SOURCE_CHANGES="$(git status --porcelain=v1 --untracked-files=all -- . ':(exclude)public')"
+          echo "Checking source files..."
 
-          if [ -n "$SOURCE_CHANGES" ]; then
-            echo "ERROR: Source files were modified outside public/"
-            echo "$SOURCE_CHANGES"
+          CHANGES="$(
+            git status \
+              --porcelain=v1 \
+              --untracked-files=all \
+              -- \
+              . \
+              ':(exclude)public/**' \
+              ':(exclude)node_modules/**'
+          )"
+
+          if [ -n "$CHANGES" ]; then
+            echo "ERROR: Source files were modified outside public/."
+            echo
+            echo "$CHANGES"
+            echo
             exit 1
           fi
 
@@ -123,6 +128,19 @@ jobs:
           fi
 
           echo "CNAME verified: $DOMAIN"
+
+      - name: Verify Public Directory
+        run: |
+          set -e
+
+          FILE_COUNT="$(find public -type f | wc -l)"
+
+          echo "Protected files: $FILE_COUNT"
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: public directory is empty."
+            exit 1
+          fi
 
       - name: Show Public Files
         run: |
@@ -166,7 +184,6 @@ jobs:
     needs: build
 
     permissions:
-      contents: read
       pages: write
       id-token: write
 
