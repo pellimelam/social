@@ -1,1 +1,294 @@
+name: Protect Frontend
 
+on:
+  workflow_dispatch:
+
+  push:
+    paths-ignore:
+      - "public/**"
+      - ".github/workflows/protect.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: protect-frontend
+  cancel-in-progress: false
+
+jobs:
+  protect:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ==========================================================
+      # CHECKOUT
+      # ==========================================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      # ==========================================================
+      # NODE.JS
+      # ==========================================================
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # ==========================================================
+      # INSTALL DEPENDENCIES
+      # ==========================================================
+
+      - name: Install Dependencies
+        run: |
+          set -e
+
+          npm install \
+            --no-audit \
+            --no-fund \
+            --package-lock=false
+
+      # ==========================================================
+      # VERIFY REQUIRED FILES
+      # ==========================================================
+
+      - name: Verify Protection Setup
+        run: |
+          set -e
+
+          echo "Checking required files..."
+
+          test -f package.json
+          test -f scripts/protect.js
+
+          echo "Required files found."
+
+          echo
+          echo "Checking npm protect script..."
+
+          node -e "
+          const fs = require('fs');
+
+          const pkg = JSON.parse(
+            fs.readFileSync('package.json', 'utf8')
+          );
+
+          if (
+            !pkg.scripts ||
+            !pkg.scripts.protect
+          ) {
+            console.error(
+              'ERROR: package.json does not contain scripts.protect'
+            );
+
+            process.exit(1);
+          }
+
+          console.log(
+            'npm run protect:',
+            pkg.scripts.protect
+          );
+          "
+
+      # ==========================================================
+      # RECORD SOURCE STATE
+      # ==========================================================
+      #
+      # This gives us a clean baseline.
+      #
+      # The protection script must NEVER modify source files.
+      #
+      # ==========================================================
+
+      - name: Record Source State
+        run: |
+          set -e
+
+          echo "Recording source repository state..."
+
+          git status --short
+
+          git diff --exit-code -- . ':!public' || {
+            echo
+            echo "ERROR: Repository already contains source changes."
+            echo "Protection requires a clean source tree."
+            exit 1
+          }
+
+          echo
+          echo "Source repository is clean."
+
+      # ==========================================================
+      # RUN PROTECTION
+      # ==========================================================
+
+      - name: Run Protection Pipeline
+        run: |
+          set -e
+
+          echo
+          echo "=============================================="
+          echo "       RUNNING VIDHWAAN PROTECTION"
+          echo "=============================================="
+          echo
+
+          npm run protect
+
+      # ==========================================================
+      # VERIFY SOURCE WAS NOT MODIFIED
+      # ==========================================================
+
+      - name: Verify Source Files Are Unchanged
+        run: |
+          set -e
+
+          echo
+          echo "Checking that source files were not modified..."
+          echo
+
+          if ! git diff --exit-code -- . ':!public'; then
+            echo
+            echo "ERROR: Protection pipeline modified source files."
+            echo
+            echo "Source files MUST remain unchanged."
+            echo "Only public/ is allowed to change."
+            echo
+
+            git status --short
+            git diff -- . ':!public'
+
+            exit 1
+          fi
+
+          echo "SUCCESS: Source files remain unchanged."
+
+      # ==========================================================
+      # VERIFY PUBLIC DIRECTORY
+      # ==========================================================
+
+      - name: Verify Public Output
+        run: |
+          set -e
+
+          echo
+          echo "Checking public/ output..."
+          echo
+
+          test -d public
+
+          echo "public/ directory exists."
+
+          FILE_COUNT=$(find public -type f | wc -l)
+
+          echo "Public files: ${FILE_COUNT}"
+
+          if [ "${FILE_COUNT}" -eq 0 ]; then
+            echo "ERROR: public/ is empty."
+            exit 1
+          fi
+
+          echo
+          echo "Public output verification passed."
+
+      # ==========================================================
+      # SHOW CHANGES
+      # ==========================================================
+
+      - name: Show Public Changes
+        run: |
+          set -e
+
+          echo
+          echo "=============================================="
+          echo "              PUBLIC CHANGES"
+          echo "=============================================="
+          echo
+
+          git status --short
+
+          echo
+          echo "Diff statistics:"
+          git diff --stat -- public || true
+
+      # ==========================================================
+      # CONFIGURE GIT
+      # ==========================================================
+
+      - name: Configure Git
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ==========================================================
+      # COMMIT ONLY PUBLIC
+      # ==========================================================
+      #
+      # IMPORTANT:
+      #
+      # Never use:
+      #
+      #   git add -A
+      #
+      # because that could commit source changes.
+      #
+      # Only public/ is staged.
+      #
+      # ==========================================================
+
+      - name: Commit Public Output
+        run: |
+          set -e
+
+          echo
+          echo "Staging ONLY public/..."
+          echo
+
+          git add -f public/
+
+          echo
+          echo "Checking staged files..."
+          echo
+
+          git diff --cached --name-only
+
+          echo
+          echo "Verifying that only public/ is staged..."
+
+          INVALID_FILES=$(git diff --cached --name-only | grep -v '^public/' || true)
+
+          if [ -n "${INVALID_FILES}" ]; then
+            echo
+            echo "ERROR: Files outside public/ are staged:"
+            echo
+            echo "${INVALID_FILES}"
+            echo
+            exit 1
+          fi
+
+          echo
+          echo "Only public/ files are staged."
+
+          if git diff --cached --quiet; then
+            echo
+            echo "No public changes detected."
+            exit 0
+          fi
+
+          git commit -m "Update protected public assets"
+
+      # ==========================================================
+      # PUSH
+      # ==========================================================
+
+      - name: Push Public Output
+        run: |
+          set -e
+
+          git push
